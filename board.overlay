@@ -1,0 +1,19 @@
+/*
+ * T3-S3 V1.3 — LilyGO ESP32-S3FH4R2
+ * Flash: 4 MB embedded (XMC)
+ * PSRAM: 2 MB embedded AP_3v3 (QPI, same MSPI bus as flash)
+ *
+ * Base board (esp32s3_devkitc) uses esp32s3_wroom_n8.dtsi which has
+ * 8 MB flash and no PSRAM. Both overrides below are required.
+ */
+
+/* Correct flash size: 4 MB, not 8 MB */
+&flash0 {
+	reg = <0x0 DT_SIZE_M(4)>;
+};
+
+/* Declare the 2 MB embedded PSRAM so Zephyr initialises the MSPI bus
+ * correctly. Without this the bus hangs after "spi_flash: flash io: dio". */
+&psram0 {
+	size = <DT_SIZE_M(2)>;
+};
