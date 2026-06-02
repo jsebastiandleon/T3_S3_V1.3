@@ -1,19 +1,71 @@
-/*
- * T3-S3 V1.3 — LilyGO ESP32-S3FH4R2
- * Flash: 4 MB embedded (XMC)
- * PSRAM: 2 MB embedded AP_3v3 (QPI, same MSPI bus as flash)
- *
- * Base board (esp32s3_devkitc) uses esp32s3_wroom_n8.dtsi which has
- * 8 MB flash and no PSRAM. Both overrides below are required.
- */
+/* =========================
+ * T3 S3 V1.3
+ * ========================= */
+#include <zephyr/dt-bindings/pinctrl/esp-pinctrl-common.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-gpio-sigmap.h>
+#include <zephyr/dt-bindings/lora/sx126x.h>
 
-/* Correct flash size: 4 MB, not 8 MB */
 &flash0 {
-	reg = <0x0 DT_SIZE_M(4)>;
+    reg = <0x0 DT_SIZE_M(4)>;
 };
 
-/* Declare the 2 MB embedded PSRAM so Zephyr initialises the MSPI bus
- * correctly. Without this the bus hangs after "spi_flash: flash io: dio". */
 &psram0 {
-	size = <DT_SIZE_M(2)>;
+    size = <DT_SIZE_M(2)>;
+};
+
+/* =========================
+ * PINCTRL: pines reales del T3-S3 V1.3
+ * DevKit default: MISO=GPIO13, SCLK=GPIO12, MOSI=GPIO11
+ * T3-S3 real:     MISO=GPIO3,  SCLK=GPIO5,  MOSI=GPIO6
+ * ========================= */
+&pinctrl {
+    spim2_default: spim2_default {
+        group1 {
+            pinmux = <SPIM2_MISO_GPIO3>,
+                     <SPIM2_SCLK_GPIO5>;
+        };
+        group2 {
+            pinmux = <SPIM2_MOSI_GPIO6>;
+            output-low;
+        };
+    };
+};
+
+/* =========================
+ * SPI2 + SX1262
+ * ========================= */
+&spi2 {
+    status = "okay";
+    pinctrl-0 = <&spim2_default>;
+    pinctrl-names = "default";
+
+    cs-gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+
+    sx1262: lora@0 {
+        compatible = "semtech,sx1262";
+        reg = <0>;
+
+        spi-max-frequency = <4000000>;
+
+        reset-gpios = <&gpio0 8  GPIO_ACTIVE_LOW>;
+        busy-gpios  = <&gpio1 2  GPIO_ACTIVE_HIGH>;  /* GPIO34 = gpio1 pin 2 */
+        dio1-gpios  = <&gpio1 1  GPIO_ACTIVE_HIGH>;  /* GPIO33 = gpio1 pin 1 */
+
+        /* DIO2 controla el switch RF TX/RX */
+        dio2-tx-enable;
+
+        /* TCXO 32MHz alimentado por DIO3 a 1.8V */
+        dio3-tcxo-voltage = <SX126X_DIO3_TCXO_1V8>;
+        tcxo-power-startup-delay-ms = <5>;
+    };
+};
+
+/* =========================
+ * ALIAS
+ * ========================= */
+&{/} {
+    aliases {
+        lora0 = &sx1262;
+    };
 };
