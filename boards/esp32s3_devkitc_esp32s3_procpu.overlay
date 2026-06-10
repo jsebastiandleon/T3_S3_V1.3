@@ -62,10 +62,57 @@
 };
 
 /* =========================
+ * UART0 / GPIO43-44: ya NO se reasignan a I2C.
+ * El BME688 se movio a I2C0 (GPIO47/48), por lo que UART0 vuelve a su
+ * estado por defecto y los pines 43/44 quedan libres (UART hardware o
+ * conector QWIIC). El printk sigue via ROM UART / USB (no depende del
+ * driver UART0 de Zephyr).
+ * ========================= */
+
+/* =========================
+ * PINCTRL: I2C0 en GPIO47 (SDA) y GPIO48 (SCL)
+ * Pines del header lateral (JP1), libres y sin funcion de strapping.
+ * Sobrescriben el i2c0_default del board (que usaba GPIO1/GPIO2,
+ * ocupados por Battery ADC y SD MISO).
+ * OJO HARDWARE: requieren pull-ups EXTERNOS de 4.7k a 3V3
+ * (el conector QWIIC los traia integrados; el header pelado no).
+ * ========================= */
+&pinctrl {
+    i2c0_bm688: i2c0_bm688 {
+        group1 {
+            pinmux = <I2C0_SDA_GPIO47>,
+                     <I2C0_SCL_GPIO48>;
+            bias-pull-up;
+            drive-open-drain;
+            output-high;
+        };
+    };
+};
+
+/* =========================
+ * I2C0 + BM688
+ * SD0 -> VCC  => direccion I2C = 0x77  (confirmado por i2c0_scan: ACK 0x77)
+ * CS  -> VCC  => modo I2C habilitado (obligatorio)
+ * ========================= */
+&i2c0 {
+    status = "okay";
+    pinctrl-0 = <&i2c0_bm688>;
+    pinctrl-names = "default";
+    /* clock-frequency se hereda del board (100kHz). El driver i2c_esp32
+       SOLO admite 100k/400k/1M; un valor distinto mapea a 0 y rompe el init. */
+
+    bme688: bme688@77 {
+        compatible = "bosch,bme680";
+        reg = <0x77>;
+    };
+};
+
+/* =========================
  * ALIAS
  * ========================= */
 &{/} {
     aliases {
-        lora0 = &sx1262;
+        lora0       = &sx1262;
+        bme688-sensor = &bme688;
     };
 };
