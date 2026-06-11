@@ -4,6 +4,7 @@
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/printk.h>
 #include "sensors/bm688.h"
+#include "sensors/ze15_co.h"
 
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
    Util para verificar si el bus esta electricamente vivo (pull-ups OK) y
@@ -62,6 +63,16 @@ int main(void)
     }
     /* ------------------------------------------------------------------ */
 
+    /* ---- ZE15-CO init ----------------------------------------------- */
+    const struct device *co_dev = NULL;
+    int co_ok = ze15co_init(&co_dev);
+    if (co_ok < 0) {
+        printk("ZE15-CO INIT ERR: %d (continua sin sensor)\n", co_ok);
+    } else {
+        printk("ZE15-CO READY\n");
+    }
+    /* ------------------------------------------------------------------ */
+
     const struct device *lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
     if (!device_is_ready(lora_dev)) {
         printk("LORA NOT READY\n");
@@ -116,17 +127,19 @@ int main(void)
     printk("JOINED!\n");
 
     /*
-     * Payload LoRaWAN con datos del BM688 (12 bytes, little-endian):
-     *   [0-1]  int16  temperatura × 100  (ej: 2550 = 25.50 °C)
-     *   [2-3]  uint16 humedad × 100      (ej: 6500 = 65.00 %)
-     *   [4-7]  uint32 presion en Pa      (ej: 101325)
-     *   [8-11] uint32 gas_resistance Ohm (ej: 50000)
+     * Payload LoRaWAN (14 bytes, little-endian):
+     *   [0-1]   int16  temperatura × 100   (ej: 2550 = 25.50 °C)
+     *   [2-3]   uint16 humedad × 100       (ej: 6500 = 65.00 %)
+     *   [4-7]   uint32 presion en Pa       (ej: 101325)
+     *   [8-11]  uint32 gas_resistance Ohm  (ej: 50000)
+     *   [12-13] uint16 CO ppm × 10         (ej: 125 = 12.5 ppm; 0 si no hay sensor)
      */
     struct {
         int16_t  temp_cdeg;
         uint16_t hum_cpct;
         uint32_t press_pa;
         uint32_t gas_ohm;
+        uint16_t co_ppm_x10;
     } __packed bm_payload;
 
     while (1) {
@@ -167,6 +180,23 @@ int main(void)
             }
             k_sleep(K_SECONDS(30));
             continue;
+        }
+
+        /* Leer ZE15-CO (modo Q&A) y anexar al payload. 0 si no disponible. */
+        if (co_dev != NULL) {
+            struct ze15co_data co_data;
+            int cr = ze15co_read(co_dev, &co_data);
+            if (cr == 0 && !co_data.sensor_fault) {
+                bm_payload.co_ppm_x10 = (uint16_t)(co_data.co_ppm * 10.0);
+                printk("ZE15-CO CO=%d.%01dppm\n",
+                       (int)co_data.co_ppm, (int)(co_data.co_ppm * 10) % 10);
+            } else {
+                printk("ZE15-CO READ ERR: %d%s\n", cr,
+                       (cr == 0) ? " (fault)" : "");
+                bm_payload.co_ppm_x10 = 0;
+            }
+        } else {
+            bm_payload.co_ppm_x10 = 0;
         }
 
         ret = lorawan_send(2, (uint8_t *)&bm_payload, sizeof(bm_payload),

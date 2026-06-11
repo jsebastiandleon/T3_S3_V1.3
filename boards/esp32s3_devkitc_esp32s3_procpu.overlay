@@ -108,11 +108,44 @@
 };
 
 /* =========================
+ * PINCTRL: UART1 para ZE15-CO en GPIO41 (TX) y GPIO40 (RX)
+ * Pines libres del header lateral, sin funcion de strapping.
+ * NO se usan 43/44 (UART0/ROM = printk) ni 47/48 (I2C0/BM688).
+ * ========================= */
+&pinctrl {
+    uart1_co: uart1_co {
+        group1 {
+            pinmux = <UART1_TX_GPIO41>;
+            output-high;
+        };
+        group2 {
+            pinmux = <UART1_RX_GPIO40>;
+            bias-pull-up;
+        };
+    };
+};
+
+/* =========================
+ * UART1 + ZE15-CO (monoxido de carbono)
+ * 9600 8N1 (defaults de Zephyr), modo Q&A.
+ * Alimentacion del sensor: 5~12V DC (PIN15), NO 3.3V. UART es TTL 3V.
+ * Conexion: ESP32 TX(GPIO41) -> sensor RXD(PIN7);
+ *           ESP32 RX(GPIO40) <- sensor TXD(PIN8).
+ * ========================= */
+&uart1 {
+    status = "okay";
+    current-speed = <9600>;
+    pinctrl-0 = <&uart1_co>;
+    pinctrl-names = "default";
+};
+
+/* =========================
  * ALIAS
  * ========================= */
 &{/} {
     aliases {
         lora0       = &sx1262;
         bme688-sensor = &bme688;
+        co-uart     = &uart1;
     };
 };

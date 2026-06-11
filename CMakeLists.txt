@@ -9,4 +9,5 @@ target_include_directories(app PRIVATE include)
 target_sources(app PRIVATE
     src/main.c
     src/sensors/bm688.c
+    src/sensors/ze15_co.c
 )
