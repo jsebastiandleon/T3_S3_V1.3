@@ -45,12 +45,14 @@ struct ze15co_data {
 int ze15co_init(const struct device **dev);
 
 /**
- * ze15co_read - Lee la concentracion de CO en modo Q&A.
+ * ze15co_read - Lee la concentracion de CO (Q&A o upload activo).
  *
- * Vacia el RX, envia el comando de consulta (FF 01 86 ...), espera la
- * respuesta de 9 bytes, valida cabecera (0xFF 0x86) y checksum, y extrae
- * la concentracion. El modulo conmuta a modo Q&A al recibir la consulta
- * (vuelve a upload automatico si no se le consulta en 30s).
+ * Vacia el RX, envia el comando de consulta (FF 01 86 ...) y espera una
+ * trama valida de 9 bytes: la respuesta Q&A (FF 86 ...) o, como respaldo,
+ * la trama de upload activo (FF 04 ...) que el sensor emite cada 1s en su
+ * modo por defecto. El modulo conmuta a Q&A al recibir la consulta y
+ * revierte a upload tras 30s sin consultas, por lo que con periodos de
+ * lectura >=30s el camino normal es la trama de upload.
  *
  * @param dev   Puntero obtenido con ze15co_init().
  * @param data  Estructura de salida.
