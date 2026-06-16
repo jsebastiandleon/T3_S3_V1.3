@@ -8,3 +8,10 @@ Descripcion de placa - pinout:
 
 Sensors:
 https://es.farnell.com/sensirion/sen65-sin-t/m-dulo-de-sensor-digital-i2c/dp/4785272?gross_price=true&CMP=KNC-GES-GEN-SHOPPING-Pmax-High_ROAS&gad_source=1&gad_campaignid=18071281895&gclid=Cj0KCQjwiJvQBhCYARIsAMjts3J1ehyh159j6Vxk34-JErC3etC25RBRXYX2PenL7mrabHKXf34k8RwaAnBPEALw_wcB 
+
+## Documentación
+
+- [Portal cautivo WiFi](docs/PORTAL_CAUTIVO.md) — arquitectura, configuración y build del AP + dashboard web concurrente con LoRaWAN.
+- [Manual de usuario del portal](docs/MANUAL_USUARIO_PORTAL.md) — cómo conectarse a la red y abrir la página (usuario final).
+- [Actualizar el HTML por LoRa](docs/ACTUALIZAR_HTML_LORA.md) — cambiar la página servida vía downlink LoRaWAN (FPort 10).
+- [Integración BM688](docs/BM688_INTEGRATION.md) · [Integración ZE15-CO](docs/ZE15_CO_INTEGRATION.md)
