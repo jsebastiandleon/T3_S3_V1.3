@@ -1,2 +1,6 @@
 # Zephyr build directory
 build/
+
+# Python bytecode cache (p. ej. tools/)
+__pycache__/
+*.pyc
