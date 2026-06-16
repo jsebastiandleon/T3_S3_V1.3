@@ -1,10 +1,12 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <string.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/printk.h>
 #include "sensors/bm688.h"
 #include "sensors/ze15_co.h"
+#include "portal/portal.h"
 
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
    Util para verificar si el bus esta electricamente vivo (pull-ups OK) y
@@ -45,6 +47,12 @@ static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
 {
     printk("DL port=%d rssi=%d snr=%d len=%d\n", port, rssi, snr, len);
+
+    /* Downlinks en el FPort del portal -> protocolo de actualizacion de HTML.
+       Reensambla por trozos (BEGIN/DATA/COMMIT) y valida CRC antes de aplicar. */
+    if (port == PORTAL_HTML_OTA_FPORT && data != NULL) {
+        portal_html_ota_rx(data, len);
+    }
 }
 
 int main(void)
@@ -70,6 +78,15 @@ int main(void)
         printk("ZE15-CO INIT ERR: %d (continua sin sensor)\n", co_ok);
     } else {
         printk("ZE15-CO READY\n");
+    }
+    /* ------------------------------------------------------------------ */
+
+    /* ---- Portal cautivo (WiFi AP + dashboard) ----------------------- */
+    /* Concurrente con LoRaWAN + sensores: se levanta aqui y queda sirviendo
+       en http://192.168.4.1. El HTML es actualizable por downlink LoRa. */
+    int portal_ok = portal_start();
+    if (portal_ok < 0) {
+        printk("PORTAL ERR: %d (continua sin portal)\n", portal_ok);
     }
     /* ------------------------------------------------------------------ */
 
@@ -103,6 +120,15 @@ int main(void)
     uint8_t join_eui[] = JOIN_EUI;
     uint8_t app_key[]  = APP_KEY;
 
+    /*
+     * dev_nonce NO se fija aqui: con CONFIG_LORAWAN_NVM_SETTINGS=y el backend
+     * de NVM gestiona el DevNonce (lo restaura de flash y lo incrementa de
+     * forma monotona en cada join, persistiendolo). El campo join_cfg.otaa.
+     * dev_nonce solo lo usaria el stack bajo CONFIG_LORAWAN_NVM_NONE
+     * (ver subsys/lorawan/.../lorawan.c, guardado por IS_ENABLED(NVM_NONE));
+     * con NVM activa se ignora. Por eso aqui no se inicializa ni se incrementa:
+     * hacerlo daria una falsa sensacion de control y no tiene efecto.
+     */
     struct lorawan_join_config join_cfg = {
         .mode          = LORAWAN_ACT_OTAA,
         .dev_eui       = dev_eui,
@@ -110,7 +136,6 @@ int main(void)
             .join_eui  = join_eui,
             .app_key   = app_key,
             .nwk_key   = app_key,   /* LoRaWAN 1.0.x: nwk_key == app_key */
-            .dev_nonce = 0,
         },
     };
 
@@ -121,7 +146,6 @@ int main(void)
             break;
         }
         printk("JOIN ERR: %d (retry in 10s)\n", ret);
-        join_cfg.otaa.dev_nonce++;   /* incrementar para cada intento */
         k_sleep(K_SECONDS(10));
     }
     printk("JOINED!\n");
@@ -142,70 +166,81 @@ int main(void)
         uint16_t co_ppm_x10;
     } __packed bm_payload;
 
-    while (1) {
-        /* Leer BM688 y construir payload */
-        if (bm688_dev != NULL) {
-            struct bm688_data sensor_data;
-            int r = bm688_read_data(bm688_dev, &sensor_data);
-            if (r == 0) {
-                bm_payload.temp_cdeg = (int16_t)(sensor_data.temperature * 100.0);
-                bm_payload.hum_cpct  = (uint16_t)(sensor_data.humidity    * 100.0);
-                bm_payload.press_pa  = (uint32_t)(sensor_data.pressure);
-                bm_payload.gas_ohm   = (uint32_t)(sensor_data.gas_resistance);
+    /* Snapshot que se publica al portal en cada ciclo. */
+    struct portal_sensors ps;
 
-                printk("BM688 T=%d.%02dC H=%d.%02d%% P=%dPa G=%dOhm\n",
-                       (int)sensor_data.temperature,
-                       (int)(sensor_data.temperature * 100) % 100,
-                       (int)sensor_data.humidity,
-                       (int)(sensor_data.humidity * 100) % 100,
-                       (int)sensor_data.pressure,
-                       (int)sensor_data.gas_resistance);
+    /*
+     * Cadencias DESACOPLADAS:
+     *  - Sensores + portal: cada SENSOR_PERIOD_S -> dashboard "vivo" en el AP,
+     *    independiente de la radio.
+     *  - Envio LoRa: cada LORA_PERIOD_S. En EU868 a DR0/SF12 un uplink de ~27 B
+     *    dura ~1.5 s de airtime; el 1% de duty-cycle obliga a ~150 s entre
+     *    paquetes. Enviar mas a menudo solo produce -EMSGSIZE/duty-cycle (-111).
+     *    Cuando el ADR suba el DR, podra acelerarse solo.
+     */
+    const int SENSOR_PERIOD_S = 5;
+    const int LORA_PERIOD_S   = 180;
+    int64_t last_send_ms = 0;
+    int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
+
+    while (1) {
+        memset(&bm_payload, 0, sizeof(bm_payload));
+        ps.bm688_valid = false;
+        ps.co_valid    = false;
+
+        /* BM688 (si esta presente) */
+        if (bm688_dev != NULL) {
+            struct bm688_data sd;
+            int r = bm688_read_data(bm688_dev, &sd);
+            if (r == 0) {
+                bm_payload.temp_cdeg = (int16_t)(sd.temperature * 100.0);
+                bm_payload.hum_cpct  = (uint16_t)(sd.humidity    * 100.0);
+                bm_payload.press_pa  = (uint32_t)(sd.pressure);
+                bm_payload.gas_ohm   = (uint32_t)(sd.gas_resistance);
+                ps.bm688_valid    = true;
+                ps.temperature    = sd.temperature;
+                ps.humidity       = sd.humidity;
+                ps.pressure       = sd.pressure;
+                ps.gas_resistance = sd.gas_resistance;
             } else {
                 printk("BM688 READ ERR: %d\n", r);
-                /* Payload de error: todos los campos a cero */
-                bm_payload.temp_cdeg = 0;
-                bm_payload.hum_cpct  = 0;
-                bm_payload.press_pa  = 0;
-                bm_payload.gas_ohm   = 0;
             }
-        } else {
-            /* Sensor no disponible: fallback al payload de texto original */
-            static const uint8_t fallback[] = "HELLO";
-            ret = lorawan_send(2, fallback, sizeof(fallback) - 1,
+        }
+
+        /* ZE15-CO (si esta presente) -> fluye al portal aunque falte el BM688.
+           Si falla 3 veces seguidas (p.ej. sin sensor) se deja de leer para no
+           inundar el log ni bloquear el lazo ~4.5 s por ciclo. */
+        if (co_dev != NULL) {
+            struct ze15co_data cd;
+            int cr = ze15co_read(co_dev, &cd);
+            if (cr == 0 && !cd.sensor_fault) {
+                bm_payload.co_ppm_x10 = (uint16_t)(cd.co_ppm * 10.0);
+                ps.co_valid = true;
+                ps.co_ppm   = cd.co_ppm;
+                co_fails = 0;
+            } else if (++co_fails >= 3) {
+                printk("ZE15-CO: 3 fallos seguidos, se deshabilita la lectura\n");
+                co_dev = NULL;
+            }
+        }
+
+        /* Portal: siempre actualizado (lo sirve /api/sensors). */
+        portal_update_sensors(&ps);
+
+        /* LoRa: solo en su cadencia, respetando el duty-cycle. */
+        int64_t now = k_uptime_get();
+        if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_PERIOD_S * 1000) {
+            ret = lorawan_send(2, (uint8_t *)&bm_payload, sizeof(bm_payload),
                                LORAWAN_MSG_UNCONFIRMED);
             if (ret < 0) {
+                /* -111 (duty-cycle) es normal/regulatorio en EU868, no fatal. */
                 printk("SEND ERR: %d\n", ret);
             } else {
-                printk("SEND OK (fallback)\n");
+                printk("SEND OK\n");
             }
-            k_sleep(K_SECONDS(30));
-            continue;
+            last_send_ms = now;
         }
 
-        /* Leer ZE15-CO (modo Q&A) y anexar al payload. 0 si no disponible. */
-        if (co_dev != NULL) {
-            struct ze15co_data co_data;
-            int cr = ze15co_read(co_dev, &co_data);
-            if (cr == 0 && !co_data.sensor_fault) {
-                bm_payload.co_ppm_x10 = (uint16_t)(co_data.co_ppm * 10.0);
-                printk("ZE15-CO CO=%d.%01dppm\n",
-                       (int)co_data.co_ppm, (int)(co_data.co_ppm * 10) % 10);
-            } else {
-                printk("ZE15-CO READ ERR: %d%s\n", cr,
-                       (cr == 0) ? " (fault)" : "");
-                bm_payload.co_ppm_x10 = 0;
-            }
-        } else {
-            bm_payload.co_ppm_x10 = 0;
-        }
-
-        ret = lorawan_send(2, (uint8_t *)&bm_payload, sizeof(bm_payload),
-                           LORAWAN_MSG_UNCONFIRMED);
-        if (ret < 0) {
-            printk("SEND ERR: %d\n", ret);
-        } else {
-            printk("SEND OK\n");
-        }
-        k_sleep(K_SECONDS(30));
+        k_sleep(K_SECONDS(SENSOR_PERIOD_S));
     }
 }
