@@ -37,6 +37,8 @@ struct portal_sensors {
 	double  pm10_0;          /* ug/m3           */
 	double  voc_index;       /* indice VOC      */
 	double  nox_index;       /* indice NOx      */
+	double  sen65_temp;      /* grados C (SEN65)*/
+	double  sen65_hum;       /* %RH (SEN65)     */
 	int64_t updated_uptime_ms;
 };
 

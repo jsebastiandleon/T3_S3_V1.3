@@ -58,8 +58,10 @@ static void i2c1_scan(void)
     printk("I2C1 SCAN done: %d dispositivo(s)\n", found);
 }
 
-/* DevEUI: MAC 1c:db:d4:bd:29:40 -> EUI-64 estandar (insert FF FE) */
-#define DEV_EUI  { 0x1C, 0xDB, 0xD4, 0xFF, 0xFE, 0xBD, 0x29, 0x40 }
+/* DevEUI para PRUEBAS: distinto del anterior (...29:40) para no chocar con otros
+   dispositivos dados de alta en ChirpStack. OUI real Espressif 1C:DB:D4 +
+   sufijo distintivo ...29:65.  -> DevEUI = 1CDBD4FFFEBD2965 */
+#define DEV_EUI  { 0x1C, 0xDB, 0xD4, 0xFF, 0xFE, 0xBD, 0x29, 0x65 }
 
 /* JoinEUI: todos ceros (Chirpstack acepta cualquier valor) */
 #define JOIN_EUI { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
@@ -67,6 +69,12 @@ static void i2c1_scan(void)
 /* AppKey proporcionada */
 #define APP_KEY  { 0x06, 0x26, 0x35, 0xAC, 0xC3, 0xBB, 0xC9, 0x2C, \
                    0x2F, 0xEF, 0x99, 0x4F, 0x5E, 0xF0, 0xF6, 0x9B }
+
+/* Flags de estado (byte 0 del payload): que sensores aportaron dato este ciclo. */
+#define FLAG_BM688_OK  0x01
+#define FLAG_CO_OK     0x02
+#define FLAG_CO_FAULT  0x04
+#define FLAG_SEN65_OK  0x08
 
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
@@ -198,35 +206,44 @@ int main(void)
     printk("JOINED!\n");
 
     /*
-     * Payload LoRaWAN (26 bytes, little-endian).
-     * Los bytes [0-13] son IDENTICOS a la version previa (BM688 + CO): el
-     * decoder existente sigue funcionando; el SEN65 solo AÑADE campos al final.
-     *   [0-1]   int16  temperatura × 100   (BM688; ej: 2550 = 25.50 °C)
-     *   [2-3]   uint16 humedad × 100       (BM688; ej: 6500 = 65.00 %)
-     *   [4-7]   uint32 presion en Pa       (BM688; ej: 101325)
-     *   [8-11]  uint32 gas_resistance Ohm  (BM688; ej: 50000)
-     *   [12-13] uint16 CO ppm × 10         (ZE15-CO; 0 si no hay sensor)
-     *   --- SEN65 (0 si no hay sensor) -----------------------------------
-     *   [14-15] uint16 PM1.0  × 10         (µg/m³; ej: 125 = 12.5)
-     *   [16-17] uint16 PM2.5  × 10         (µg/m³)
-     *   [18-19] uint16 PM4.0  × 10         (µg/m³)
-     *   [20-21] uint16 PM10.0 × 10         (µg/m³)
-     *   [22-23] int16  VOC index × 10      (ej: 1000 = indice 100.0)
-     *   [24-25] int16  NOx index × 10
+     * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
+     * Incluye TODOS los datos medibles de los 3 sensores + flags de estado.
+     * (Ver el decoder de ChirpStack en docs/PAYLOAD_DECODER.md.)
+     *   [0]     uint8  flags: bit0 BM688 ok, bit1 CO ok, bit2 CO fault, bit3 SEN65 ok
+     *   --- BM688 (ambiental) --------------------------------------------
+     *   [1-2]   int16  temperatura  × 100  (°C)
+     *   [3-4]   uint16 humedad      × 100  (%RH)
+     *   [5-6]   uint16 presion      × 10   (hPa; = Pa/10, p.ej. 10091 = 1009.1 hPa)
+     *   [7-10]  uint32 gas resistance      (Ohm)
+     *   --- ZE15-CO ------------------------------------------------------
+     *   [11-12] uint16 CO           × 10   (ppm)
+     *   --- SEN65 (calidad de aire) --------------------------------------
+     *   [13-14] uint16 PM1.0        × 10   (µg/m³)
+     *   [15-16] uint16 PM2.5        × 10   (µg/m³)
+     *   [17-18] uint16 PM4.0        × 10   (µg/m³)
+     *   [19-20] uint16 PM10.0       × 10   (µg/m³)
+     *   [21-22] uint16 humedad SEN65 × 100 (%RH)
+     *   [23-24] int16  temp SEN65    × 100 (°C)
+     *   [25-26] uint16 VOC index    × 10
+     *   [27-28] uint16 NOx index    × 10
+     * Los campos de un sensor ausente van a 0 (consultar los flags en byte 0).
      */
     struct {
-        int16_t  temp_cdeg;
-        uint16_t hum_cpct;
-        uint32_t press_pa;
-        uint32_t gas_ohm;
+        uint8_t  flags;
+        int16_t  bm_temp_cdeg;
+        uint16_t bm_hum_cpct;
+        uint16_t bm_press_dhpa;
+        uint32_t bm_gas_ohm;
         uint16_t co_ppm_x10;
         uint16_t pm1_0_x10;
         uint16_t pm2_5_x10;
         uint16_t pm4_0_x10;
         uint16_t pm10_0_x10;
-        int16_t  voc_x10;
-        int16_t  nox_x10;
-    } __packed bm_payload;
+        uint16_t sen_hum_cpct;
+        int16_t  sen_temp_cdeg;
+        uint16_t voc_x10;
+        uint16_t nox_x10;
+    } __packed payload;
 
     /* Snapshot que se publica al portal en cada ciclo. */
     struct portal_sensors ps;
@@ -246,7 +263,7 @@ int main(void)
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
     while (1) {
-        memset(&bm_payload, 0, sizeof(bm_payload));
+        memset(&payload, 0, sizeof(payload));
         ps.bm688_valid = false;
         ps.co_valid    = false;
         ps.sen65_valid = false;
@@ -256,10 +273,11 @@ int main(void)
             struct bm688_data sd;
             int r = bm688_read_data(bm688_dev, &sd);
             if (r == 0) {
-                bm_payload.temp_cdeg = (int16_t)(sd.temperature * 100.0);
-                bm_payload.hum_cpct  = (uint16_t)(sd.humidity    * 100.0);
-                bm_payload.press_pa  = (uint32_t)(sd.pressure);
-                bm_payload.gas_ohm   = (uint32_t)(sd.gas_resistance);
+                payload.bm_temp_cdeg  = (int16_t)(sd.temperature * 100.0);
+                payload.bm_hum_cpct   = (uint16_t)(sd.humidity   * 100.0);
+                payload.bm_press_dhpa = (uint16_t)(sd.pressure / 10.0);
+                payload.bm_gas_ohm    = (uint32_t)(sd.gas_resistance);
+                payload.flags |= FLAG_BM688_OK;
                 ps.bm688_valid    = true;
                 ps.temperature    = sd.temperature;
                 ps.humidity       = sd.humidity;
@@ -277,28 +295,37 @@ int main(void)
             struct ze15co_data cd;
             int cr = ze15co_read(co_dev, &cd);
             if (cr == 0 && !cd.sensor_fault) {
-                bm_payload.co_ppm_x10 = (uint16_t)(cd.co_ppm * 10.0);
+                payload.co_ppm_x10 = (uint16_t)(cd.co_ppm * 10.0);
+                payload.flags |= FLAG_CO_OK;
                 ps.co_valid = true;
                 ps.co_ppm   = cd.co_ppm;
                 co_fails = 0;
-            } else if (++co_fails >= 3) {
-                printk("ZE15-CO: 3 fallos seguidos, se deshabilita la lectura\n");
-                co_dev = NULL;
+            } else {
+                if (cr == 0 && cd.sensor_fault) {
+                    payload.flags |= FLAG_CO_FAULT;  /* sensor reporta fallo interno */
+                }
+                if (++co_fails >= 3) {
+                    printk("ZE15-CO: 3 fallos seguidos, se deshabilita la lectura\n");
+                    co_dev = NULL;
+                }
             }
         }
 
-        /* SEN65 (si esta presente): calidad de aire. Comparte el bus I2C0 con
-           el BM688; conserva la ultima lectura si aun no hay dato nuevo. */
+        /* SEN65 (si esta presente): calidad de aire en su bus propio I2C1
+           (GPIO15/16); conserva la ultima lectura si aun no hay dato nuevo. */
         if (sen65_dev != NULL) {
             struct sen6x_data ad;
             int ar = sen6x_read(sen65_dev, &ad);
             if (ar == 0) {
-                bm_payload.pm1_0_x10  = (uint16_t)(ad.pm1_0  * 10.0);
-                bm_payload.pm2_5_x10  = (uint16_t)(ad.pm2_5  * 10.0);
-                bm_payload.pm4_0_x10  = (uint16_t)(ad.pm4_0  * 10.0);
-                bm_payload.pm10_0_x10 = (uint16_t)(ad.pm10_0 * 10.0);
-                bm_payload.voc_x10    = (int16_t)(ad.voc_index * 10.0);
-                bm_payload.nox_x10    = (int16_t)(ad.nox_index * 10.0);
+                payload.pm1_0_x10    = (uint16_t)(ad.pm1_0  * 10.0);
+                payload.pm2_5_x10    = (uint16_t)(ad.pm2_5  * 10.0);
+                payload.pm4_0_x10    = (uint16_t)(ad.pm4_0  * 10.0);
+                payload.pm10_0_x10   = (uint16_t)(ad.pm10_0 * 10.0);
+                payload.sen_hum_cpct  = (uint16_t)(ad.humidity    * 100.0);
+                payload.sen_temp_cdeg = (int16_t)(ad.temperature * 100.0);
+                payload.voc_x10      = (uint16_t)(ad.voc_index * 10.0);
+                payload.nox_x10      = (uint16_t)(ad.nox_index * 10.0);
+                payload.flags |= FLAG_SEN65_OK;
                 ps.sen65_valid = true;
                 ps.pm1_0       = ad.pm1_0;
                 ps.pm2_5       = ad.pm2_5;
@@ -306,6 +333,8 @@ int main(void)
                 ps.pm10_0      = ad.pm10_0;
                 ps.voc_index   = ad.voc_index;
                 ps.nox_index   = ad.nox_index;
+                ps.sen65_temp  = ad.temperature;
+                ps.sen65_hum   = ad.humidity;
             } else {
                 printk("SEN65 READ ERR: %d\n", ar);
             }
@@ -317,7 +346,7 @@ int main(void)
         /* LoRa: solo en su cadencia, respetando el duty-cycle. */
         int64_t now = k_uptime_get();
         if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_PERIOD_S * 1000) {
-            ret = lorawan_send(2, (uint8_t *)&bm_payload, sizeof(bm_payload),
+            ret = lorawan_send(2, (uint8_t *)&payload, sizeof(payload),
                                LORAWAN_MSG_UNCONFIRMED);
             if (ret < 0) {
                 /* -111 (duty-cycle) es normal/regulatorio en EU868, no fatal. */
