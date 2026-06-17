@@ -2,8 +2,7 @@
 #include <zephyr/device.h>
 #include <string.h>
 #include <zephyr/drivers/i2c.h>
-/* LoRa temporalmente deshabilitado (probando los 3 sensores a la vez):
-   #include <zephyr/lorawan/lorawan.h> */
+#include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/printk.h>
 #include "sensors/bm688.h"
 #include "sensors/ze15_co.h"
@@ -59,7 +58,6 @@ static void i2c1_scan(void)
     printk("I2C1 SCAN done: %d dispositivo(s)\n", found);
 }
 
-#if 0  /* ===== LoRaWAN deshabilitado temporalmente (probando 3 sensores) ===== */
 /* DevEUI: MAC 1c:db:d4:bd:29:40 -> EUI-64 estandar (insert FF FE) */
 #define DEV_EUI  { 0x1C, 0xDB, 0xD4, 0xFF, 0xFE, 0xBD, 0x29, 0x40 }
 
@@ -81,7 +79,6 @@ static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
         portal_html_ota_rx(data, len);
     }
 }
-#endif /* LoRaWAN deshabilitado temporalmente */
 
 int main(void)
 {
@@ -131,7 +128,6 @@ int main(void)
     }
     /* ------------------------------------------------------------------ */
 
-#if 0  /* ===== LoRaWAN deshabilitado temporalmente (probando 3 sensores) ===== */
     const struct device *lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
     if (!device_is_ready(lora_dev)) {
         printk("LORA NOT READY\n");
@@ -151,6 +147,15 @@ int main(void)
         return 0;
     }
     printk("LORAWAN STARTED\n");
+
+    /*
+     * ADR (Adaptive Data Rate) — optimizacion clave del envio: el network server
+     * ajusta SF/DR del nodo. Arranca en DR0/SF12 (max alcance, ~1.5 s de airtime
+     * para 26 B) y, si el enlace lo permite, ChirpStack lo sube hasta SF7
+     * (~70 ms): menos airtime, menos consumo y mas margen de duty-cycle. Funciona
+     * con uplinks unconfirmed (mecanismo ADRACKReq gestionado por el stack).
+     */
+    lorawan_enable_adr(true);
 
     static struct lorawan_downlink_cb dl = {
         .port = LW_RECV_PORT_ANY,
@@ -191,7 +196,6 @@ int main(void)
         k_sleep(K_SECONDS(10));
     }
     printk("JOINED!\n");
-#endif /* LoRaWAN deshabilitado temporalmente */
 
     /*
      * Payload LoRaWAN (26 bytes, little-endian).
@@ -237,10 +241,8 @@ int main(void)
      *    Cuando el ADR suba el DR, podra acelerarse solo.
      */
     const int SENSOR_PERIOD_S = 5;
-#if 0  /* LoRa deshabilitado temporalmente */
     const int LORA_PERIOD_S   = 180;
     int64_t last_send_ms = 0;
-#endif
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
     while (1) {
@@ -312,11 +314,6 @@ int main(void)
         /* Portal: siempre actualizado (lo sirve /api/sensors). */
         portal_update_sensors(&ps);
 
-        /* bm_payload queda relleno y listo para LoRa, que esta deshabilitado
-           temporalmente; el (void) evita el warning "set but not used". */
-        (void)bm_payload;
-
-#if 0  /* ===== Envio LoRa deshabilitado temporalmente ===== */
         /* LoRa: solo en su cadencia, respetando el duty-cycle. */
         int64_t now = k_uptime_get();
         if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_PERIOD_S * 1000) {
@@ -330,7 +327,6 @@ int main(void)
             }
             last_send_ms = now;
         }
-#endif /* Envio LoRa deshabilitado temporalmente */
 
         k_sleep(K_SECONDS(SENSOR_PERIOD_S));
     }
