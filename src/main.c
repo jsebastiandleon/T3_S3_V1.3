@@ -35,6 +35,30 @@ static void i2c0_scan(void)
     printk("I2C0 SCAN done: %d dispositivo(s)\n", found);
 }
 
+/* Escaner de diagnostico del bus I2C1 (SEN65). Mismo proposito que el de I2C0:
+   confirmar si ALGO responde en el bus (pull-ups/cableado/alimentacion OK). */
+static void i2c1_scan(void)
+{
+    const struct device *i2c = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+    if (!device_is_ready(i2c)) {
+        printk("I2C1 SCAN: bus no listo\n");
+        return;
+    }
+    printk("I2C1 SCAN (100kHz, SDA=15 SCL=16):\n");
+    int found = 0;
+    for (uint8_t addr = 0x03; addr <= 0x77; addr++) {
+        uint8_t b;
+        struct i2c_msg msg = {
+            .buf = &b, .len = 1, .flags = I2C_MSG_READ | I2C_MSG_STOP,
+        };
+        if (i2c_transfer(i2c, &msg, 1, addr) == 0) {
+            printk("  ACK 0x%02x\n", addr);
+            found++;
+        }
+    }
+    printk("I2C1 SCAN done: %d dispositivo(s)\n", found);
+}
+
 #if 0  /* ===== LoRaWAN deshabilitado temporalmente (probando 3 sensores) ===== */
 /* DevEUI: MAC 1c:db:d4:bd:29:40 -> EUI-64 estandar (insert FF FE) */
 #define DEV_EUI  { 0x1C, 0xDB, 0xD4, 0xFF, 0xFE, 0xBD, 0x29, 0x40 }
@@ -64,6 +88,7 @@ int main(void)
     printk("BOOT\n");
 
     i2c0_scan();
+    i2c1_scan();
 
     /* ---- BM688 init ------------------------------------------------- */
     const struct device *bm688_dev = NULL;
