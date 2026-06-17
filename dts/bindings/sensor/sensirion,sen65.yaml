@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Binding minimo para el nodo de calidad de aire Sensirion SEN65 en I2C.
+# No existe driver nativo de Zephyr para la familia SEN6x en este arbol, por lo
+# que la logica vive en la capa de aplicacion (src/sensors/sen6x.c). Este binding
+# solo aporta el 'compatible' para que el nodo del overlay no genere warning y
+# para poder resolver bus+direccion con I2C_DT_SPEC_GET().
+#
+# Zephyr anade automaticamente <APPLICATION_SOURCE_DIR>/dts/bindings a la ruta
+# de busqueda de bindings; no requiere cambios en CMake.
+
+description: Sensirion SEN65 air quality sensor node (PM, RH&T, VOC, NOx) over I2C
+
+compatible: "sensirion,sen65"
+
+include: [sensor-device.yaml, i2c-device.yaml]

@@ -22,7 +22,9 @@ extern void captive_dns_start(void);
 
 #define AP_IP      "192.168.4.1"
 #define AP_NETMASK "255.255.255.0"
-#define AP_PSK     "t3s3portal"     /* >= 8 chars para WPA2 */
+#define AP_SSID    "Gesinen_WildFire"   /* nombre fijo de la red del portal */
+/* AP ABIERTO: sin contrasena (WIFI_SECURITY_TYPE_NONE). El usuario se conecta
+   sin teclear clave y el portal cautivo se abre solo. */
 
 /* ---- Snapshot de sensores ----------------------------------------------- */
 static struct portal_sensors snapshot;
@@ -78,24 +80,12 @@ static int setup_ap_ip(struct net_if *ap)
 
 static int enable_softap(struct net_if *ap)
 {
-	static char ssid[16];
-	struct net_linkaddr *ll = net_if_get_link_addr(ap);
-
-	if (ll && ll->len >= 6) {
-		snprintf(ssid, sizeof(ssid), "T3S3-%02X%02X",
-			 ll->addr[4], ll->addr[5]);
-	} else {
-		strcpy(ssid, "T3S3-Setup");
-	}
-
 	struct wifi_connect_req_params p = {
-		.ssid = (const uint8_t *)ssid,
-		.ssid_length = strlen(ssid),
-		.psk = (const uint8_t *)AP_PSK,
-		.psk_length = strlen(AP_PSK),
+		.ssid = (const uint8_t *)AP_SSID,
+		.ssid_length = strlen(AP_SSID),
 		.channel = WIFI_CHANNEL_ANY,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
-		.security = WIFI_SECURITY_TYPE_PSK,
+		.security = WIFI_SECURITY_TYPE_NONE,   /* red ABIERTA, sin clave */
 	};
 
 	int ret = net_mgmt(NET_REQUEST_WIFI_AP_ENABLE, ap, &p,
@@ -104,7 +94,7 @@ static int enable_softap(struct net_if *ap)
 		LOG_ERR("AP_ENABLE err %d", ret);
 		return ret;
 	}
-	LOG_INF("SoftAP activo: SSID=\"%s\" PSK=\"%s\"", ssid, AP_PSK);
+	LOG_INF("SoftAP ABIERTO (sin clave): SSID=\"%s\"", AP_SSID);
 	return 0;
 }
 

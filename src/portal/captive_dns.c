@@ -67,18 +67,36 @@ static void captive_dns_thread(void *a, void *b, void *c)
 		while (q < (size_t)n && buf[q] != 0) {
 			q += buf[q] + 1; /* saltar etiqueta */
 		}
+		/* q apunta al 0x00 final del QNAME; QTYPE va justo despues. */
+		if (q + 2 >= (size_t)n) {
+			continue;
+		}
+		uint16_t qtype = (buf[q + 1] << 8) | buf[q + 2];
 		q += 1;        /* byte 0x00 final del QNAME */
 		q += 4;        /* QTYPE(2) + QCLASS(2)       */
 		if (q > (size_t)n || q + 16 > DNS_BUF_SIZE) {
 			continue;
 		}
 
-		/* Cabecera: marcar respuesta (QR=1, RA=1), ANCOUNT=1. */
+		/* Cabecera comun de respuesta: QR=1, RA=1, RCODE=0. */
 		buf[2] = 0x81; /* QR=1, Opcode=0, AA=0, TC=0, RD (espejo) */
 		buf[3] = 0x80; /* RA=1, RCODE=0                          */
-		buf[6] = 0x00; buf[7] = 0x01; /* ANCOUNT = 1             */
-		buf[8] = 0x00; buf[9] = 0x00; /* NSCOUNT = 0             */
+		buf[8] = 0x00; buf[9] = 0x00;   /* NSCOUNT = 0           */
 		buf[10] = 0x00; buf[11] = 0x00; /* ARCOUNT = 0           */
+
+		/* Solo respondemos registros A (IPv4). Para AAAA u otros tipos
+		 * devolvemos una respuesta SIN answers (ANCOUNT=0) en lugar de un
+		 * A malformado: asi el resolvedor del movil no descarta toda la
+		 * respuesta y el camino IPv4 (registro A) sigue resolviendo al
+		 * portal. */
+		if (qtype != 0x0001) {
+			buf[6] = 0x00; buf[7] = 0x00; /* ANCOUNT = 0 */
+			(void)zsock_sendto(sock, buf, q, 0,
+					   (struct sockaddr *)&src, slen);
+			continue;
+		}
+
+		buf[6] = 0x00; buf[7] = 0x01; /* ANCOUNT = 1 */
 
 		/* Respuesta: puntero al QNAME, A/IN, TTL=60, RDATA=AP_IP. */
 		size_t a = q;

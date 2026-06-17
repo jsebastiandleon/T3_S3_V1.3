@@ -21,6 +21,7 @@ target_sources(app PRIVATE
     src/main.c
     src/sensors/bm688.c
     src/sensors/ze15_co.c
+    src/sensors/sen6x.c
     src/portal/portal.c
     src/portal/portal_html.c
     src/portal/captive_dns.c

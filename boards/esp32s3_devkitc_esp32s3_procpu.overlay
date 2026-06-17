@@ -108,6 +108,50 @@
 };
 
 /* =========================
+ * PINCTRL: I2C1 en GPIO15 (SDA) y GPIO16 (SCL) para el SEN65.
+ * Bus SEPARADO del I2C0/BME688 a peticion: el SEN65 NO comparte pines con el
+ * BME688. El board define un i2c1_default (GPIO4/5); este pinctrl lo sobrescribe
+ * a GPIO15/16 (libres en este proyecto, sin strapping).
+ * OJO HARDWARE: pines de header pelado -> requieren pull-ups EXTERNOS de 4.7k a
+ * 3V3 en SDA y SCL (no hay QWIIC que los traiga integrados).
+ * ========================= */
+&pinctrl {
+    i2c1_sen65: i2c1_sen65 {
+        group1 {
+            pinmux = <I2C1_SDA_GPIO15>,
+                     <I2C1_SCL_GPIO16>;
+            bias-pull-up;
+            drive-open-drain;
+            output-high;
+        };
+    };
+};
+
+/* =========================
+ * I2C1 + SEN65 (Sensirion) — nodo de calidad de aire: PM1/2.5/4/10, RH&T, VOC, NOx.
+ * Bus propio (I2C1), independiente del BME688:
+ *   - SDA=GPIO15  SCL=GPIO16  (100kHz, maximo del SEN6x en standard mode)
+ *   - Direccion SEN65 = 0x6B (7-bit)
+ *
+ * OJO HARDWARE: el SEN65 se alimenta a 3.3V (3.15-3.45V) y tiene ventilador +
+ * laser; pico de corriente ~200mA. Asegurar que el regulador 3V3 lo soporta
+ * (o alimentarlo de una fuente 3V3 con GND comun). Pinout del conector (6 pines):
+ *   1 VDD(3V3)  2 GND  3 SDA(->GPIO15)  4 SCL(->GPIO16)  5 GND  6 VDD.
+ * ========================= */
+&i2c1 {
+    status = "okay";
+    pinctrl-0 = <&i2c1_sen65>;
+    pinctrl-names = "default";
+    /* clock-frequency se hereda (100kHz). El driver i2c_esp32 solo admite
+       100k/400k/1M; otro valor mapea a 0 y rompe el init (igual que I2C0). */
+
+    sen65: sen65@6b {
+        compatible = "sensirion,sen65";
+        reg = <0x6b>;
+    };
+};
+
+/* =========================
  * PINCTRL: UART1 para ZE15-CO en GPIO41 (TX) y GPIO40 (RX)
  * Pines libres del header lateral, sin funcion de strapping.
  * NO se usan 43/44 (UART0/ROM = printk) ni 47/48 (I2C0/BM688).
@@ -147,5 +191,6 @@
         lora0       = &sx1262;
         bme688-sensor = &bme688;
         co-uart     = &uart1;
+        sen65-sensor = &sen65;
     };
 };

@@ -30,6 +30,13 @@ struct portal_sensors {
 	double  gas_resistance;  /* Ohm             */
 	bool    co_valid;
 	double  co_ppm;          /* ppm             */
+	bool    sen65_valid;
+	double  pm1_0;           /* ug/m3           */
+	double  pm2_5;           /* ug/m3           */
+	double  pm4_0;           /* ug/m3           */
+	double  pm10_0;          /* ug/m3           */
+	double  voc_index;       /* indice VOC      */
+	double  nox_index;       /* indice NOx      */
 	int64_t updated_uptime_ms;
 };
 
