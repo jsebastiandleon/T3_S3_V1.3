@@ -10,13 +10,6 @@ target_include_directories(app PRIVATE include)
 # (necesaria para los simbolos _http_resource_desc_portal_http_service_list_*).
 zephyr_linker_sources(SECTIONS sections-rom.ld)
 
-# Imagen del portal: gorila.jpg -> array C embebido en flash, servido en
-# /gorila.jpg por el HTTP server. Se genera gorila.jpg.inc en el dir generado
-# (ya en el include path) para hacer #include desde http_routes.c.
-generate_inc_file_for_target(app
-    ${CMAKE_CURRENT_SOURCE_DIR}/gorila.jpg
-    ${ZEPHYR_BINARY_DIR}/include/generated/gorila.jpg.inc)
-
 target_sources(app PRIVATE
     src/main.c
     src/sensors/bm688.c

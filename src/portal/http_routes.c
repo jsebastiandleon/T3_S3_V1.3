@@ -27,21 +27,6 @@ static const struct http_header json_ctype[] = {
 	{ .name = "Content-Type", .value = "application/json" },
 };
 
-/* ---- GET /gorila.jpg: imagen embebida (recurso estatico) ---------------- */
-static const uint8_t gorila_jpg[] = {
-#include "gorila.jpg.inc"
-};
-
-static struct http_resource_detail_static gorila_resource = {
-	.common = {
-		.type = HTTP_RESOURCE_TYPE_STATIC,
-		.bitmask_of_supported_http_methods = BIT(HTTP_GET),
-		.content_type = "image/jpeg",
-	},
-	.static_data = gorila_jpg,
-	.static_data_len = sizeof(gorila_jpg),
-};
-
 /* ---- GET / (y fallback): dashboard HTML --------------------------------- */
 static int index_handler(struct http_client_ctx *client,
 			 enum http_transaction_status status,
@@ -141,6 +126,36 @@ static struct http_resource_detail_dynamic sensors_resource = {
 	.cb = sensors_handler,
 };
 
+/* ---- GET /api/sos: dispara un uplink LoRa de emergencia ----------------- */
+static int sos_handler(struct http_client_ctx *client,
+		       enum http_transaction_status status,
+		       const struct http_request_ctx *req,
+		       struct http_response_ctx *rsp, void *user_data)
+{
+	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(user_data);
+	static const char ok[] = "{\"sos\":\"queued\"}";
+
+	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
+		portal_request_sos();
+		LOG_WRN("SOS solicitado desde el portal");
+		rsp->status = HTTP_200_OK;
+		rsp->headers = json_ctype;
+		rsp->header_count = ARRAY_SIZE(json_ctype);
+		rsp->body = ok;
+		rsp->body_len = sizeof(ok) - 1;
+		rsp->final_chunk = true;
+	}
+	return 0;
+}
+
+static struct http_resource_detail_dynamic sos_resource = {
+	.common = {
+		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		.bitmask_of_supported_http_methods = BIT(HTTP_GET),
+	},
+	.cb = sos_handler,
+};
+
 /* ---- Fallback de portal cautivo: 302 redirect a la pagina --------------- */
 /* Responder con redirect (en vez de servir el HTML directo) hace que el
  * Captive Network Assistant de Android/iOS/Windows abra la pagina de forma
@@ -186,5 +201,4 @@ HTTP_SERVICE_DEFINE(portal_http_service, NULL, &http_port, 4, 8, NULL,
 HTTP_RESOURCE_DEFINE(portal_index, portal_http_service, "/", &index_resource);
 HTTP_RESOURCE_DEFINE(portal_sensors, portal_http_service, "/api/sensors",
 		     &sensors_resource);
-HTTP_RESOURCE_DEFINE(portal_gorila, portal_http_service, "/gorila.jpg",
-		     &gorila_resource);
+HTTP_RESOURCE_DEFINE(portal_sos, portal_http_service, "/api/sos", &sos_resource);

@@ -2,6 +2,7 @@
 #include <zephyr/device.h>
 #include <string.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/printk.h>
 #include "sensors/bm688.h"
@@ -58,10 +59,9 @@ static void i2c1_scan(void)
     printk("I2C1 SCAN done: %d dispositivo(s)\n", found);
 }
 
-/* DevEUI para PRUEBAS: distinto del anterior (...29:40) para no chocar con otros
-   dispositivos dados de alta en ChirpStack. OUI real Espressif 1C:DB:D4 +
-   sufijo distintivo ...29:65.  -> DevEUI = 1CDBD4FFFEBD2965 */
-#define DEV_EUI  { 0x1C, 0xDB, 0xD4, 0xFF, 0xFE, 0xBD, 0x29, 0x65 }
+/* DevEUI: se deriva en runtime de la MAC del ESP32 (eFuse) -> EUI-64 estandar
+   insertando FF FE en el medio. Se carga sola en cada arranque y se imprime por
+   consola al unir, para darla de alta en ChirpStack. (Ver build en main().) */
 
 /* JoinEUI: todos ceros (Chirpstack acepta cualquier valor) */
 #define JOIN_EUI { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
@@ -171,7 +171,24 @@ int main(void)
     };
     lorawan_register_downlink_callback(&dl);
 
-    uint8_t dev_eui[]  = DEV_EUI;
+    /* DevEUI = MAC del chip (eFuse via hwinfo) -> EUI-64 (insertar FF FE). */
+    uint8_t dev_eui[8];
+    uint8_t mac[6];
+    ssize_t mlen = hwinfo_get_device_id(mac, sizeof(mac));
+    if (mlen == (ssize_t)sizeof(mac)) {
+        dev_eui[0] = mac[0]; dev_eui[1] = mac[1]; dev_eui[2] = mac[2];
+        dev_eui[3] = 0xFF;   dev_eui[4] = 0xFE;
+        dev_eui[5] = mac[3]; dev_eui[6] = mac[4]; dev_eui[7] = mac[5];
+    } else {
+        printk("HWINFO MAC err %d -> DevEUI de respaldo\n", (int)mlen);
+        static const uint8_t fb[8] = {0x1C, 0xDB, 0xD4, 0xFF,
+                                      0xFE, 0xBD, 0x29, 0x65};
+        memcpy(dev_eui, fb, sizeof(fb));
+    }
+    printk("DevEUI(MAC)=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+           dev_eui[0], dev_eui[1], dev_eui[2], dev_eui[3],
+           dev_eui[4], dev_eui[5], dev_eui[6], dev_eui[7]);
+
     uint8_t join_eui[] = JOIN_EUI;
     uint8_t app_key[]  = APP_KEY;
 
@@ -263,6 +280,15 @@ int main(void)
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
     while (1) {
+        /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
+           en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
+        if (portal_take_sos()) {
+            static const uint8_t sos_msg[] = { 'S', 'O', 'S' };
+            int sret = lorawan_send(3, (uint8_t *)sos_msg, sizeof(sos_msg),
+                                    LORAWAN_MSG_UNCONFIRMED);
+            printk("SOS enviado (FPort 3): %d\n", sret);
+        }
+
         memset(&payload, 0, sizeof(payload));
         ps.bm688_valid = false;
         ps.co_valid    = false;

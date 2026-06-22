@@ -3,8 +3,14 @@
 Nodo multisensor de calidad de aire. Uplink LoRaWAN (EU868, OTAA, **FPort 2**,
 **unconfirmed**, **ADR on**). Payload **v2**: binario, little-endian, **29 bytes**.
 
-DevEUI de pruebas: **`1CDBD4FFFEBD2965`** · JoinEUI: `0000000000000000` ·
-AppKey: `062635ACC3BBC92C2FEF994F5EF0F69B`.
+**DevEUI = MAC del ESP32** (eFuse), derivada en runtime y cargada sola en cada
+arranque (EUI-64 estándar insertando `FF FE`). Se imprime en el log de boot como
+`DevEUI(MAC)=...`; para esta placa es **`1CDBD4FFFEBD2444`**. JoinEUI:
+`0000000000000000` · AppKey: `062635ACC3BBC92C2FEF994F5EF0F69B`.
+
+**FPort 2** = datos de sensores (este doc). **FPort 3** = botón de EMERGENCIA:
+payload ASCII `"SOS"` (3 B); el decoder lo devuelve como
+`{"alert":"SOS","source":"panic_button"}`.
 
 ---
 
@@ -100,6 +106,7 @@ en **Device Profile → Codec → JavaScript functions**. Resumen de la salida:
 ## 4. Alta en ChirpStack (resumen)
 1. **Device profile**: LoRaWAN 1.0.x, región EU868, **ADR habilitado**, pega el
    codec JS de arriba.
-2. **Device**: DevEUI `1CDBD4FFFEBD2965`, JoinEUI `0000000000000000`.
+2. **Device**: DevEUI = la que imprime el boot (`DevEUI(MAC)=`, p.ej.
+   `1CDBD4FFFEBD2444`), JoinEUI `0000000000000000`.
 3. **OTAA keys**: AppKey `062635ACC3BBC92C2FEF994F5EF0F69B`.
 4. Encender el nodo → Join → llegan uplinks en FPort 2 decodificados.

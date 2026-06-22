@@ -9,6 +9,11 @@
 function decodeUplink(input) {
   var b = input.bytes;
 
+  // FPort 3 = boton de EMERGENCIA (SOS), no datos de sensores.
+  if (input.fPort === 3) {
+    return { data: { alert: "SOS", source: "panic_button" } };
+  }
+
   if (b.length < 29) {
     return { errors: ["payload demasiado corto: " + b.length + " (esperado 29)"] };
   }

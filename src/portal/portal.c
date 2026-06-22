@@ -45,6 +45,20 @@ void portal_get_sensors(struct portal_sensors *out)
 	k_mutex_unlock(&snapshot_lock);
 }
 
+/* ---- Boton de emergencia (SOS) ----------------------------------------- */
+static atomic_t sos_pending;
+
+void portal_request_sos(void)
+{
+	atomic_set(&sos_pending, 1);
+}
+
+bool portal_take_sos(void)
+{
+	/* atomic_set devuelve el valor previo: limpia y avisa si estaba pendiente. */
+	return atomic_set(&sos_pending, 0) == 1;
+}
+
 /* ---- Arranque ------------------------------------------------------------ */
 static bool started;
 

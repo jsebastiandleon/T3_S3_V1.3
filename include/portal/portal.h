@@ -51,10 +51,19 @@ void portal_update_sensors(const struct portal_sensors *s);
 /* Copia atomica del snapshot actual (para el handler HTTP). */
 void portal_get_sensors(struct portal_sensors *out);
 
+/* ---- Boton de emergencia (SOS) ----------------------------------------- */
+/* portal_request_sos(): lo llama el handler HTTP /api/sos (hilo del servidor).
+ * portal_take_sos():    lo consume el lazo principal; devuelve true UNA vez si
+ *                       habia un SOS pendiente (y lo limpia) -> envia uplink LoRa
+ *                       de SOS en FPort 3. Thread-safe (atomic). */
+void portal_request_sos(void);
+bool portal_take_sos(void);
+
 /* ---- HTML mutable del portal -------------------------------------------- */
 
-/* Tamano maximo del HTML servido/actualizable. */
-#define PORTAL_HTML_MAX 4096
+/* Tamano maximo del HTML servido/actualizable. Subido a 10K para el dashboard
+   con graficos. OJO: hay 2 buffers de este tamano (vivo + staging OTA). */
+#define PORTAL_HTML_MAX 10240
 
 /* Carga el HTML desde Settings (NVS); si no existe usa el default empotrado.
  * Lo llama portal_start(); expuesto por claridad. */
