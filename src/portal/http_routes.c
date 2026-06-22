@@ -180,7 +180,7 @@ static uint16_t http_port = 80;
 
 /* El fallback (7o arg) redirige (302) cualquier ruta no mapeada a la pagina,
  * disparando la apertura automatica del portal cautivo del SO. */
-HTTP_SERVICE_DEFINE(portal_http_service, NULL, &http_port, 2, 4, NULL,
+HTTP_SERVICE_DEFINE(portal_http_service, NULL, &http_port, 4, 8, NULL,
 		    &captive_resource.common, NULL);
 
 HTTP_RESOURCE_DEFINE(portal_index, portal_http_service, "/", &index_resource);
