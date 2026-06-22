@@ -4,3 +4,8 @@ build/
 # Python bytecode cache (p. ej. tools/)
 __pycache__/
 *.pyc
+
+# Archivos temporales de editores (vim swap, etc.)
+*.swp
+*.swo
+*~
