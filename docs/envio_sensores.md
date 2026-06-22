@@ -148,6 +148,50 @@ El nodo **arranca siempre en SF12/DR0** hasta que el ADR lo baje, así que:
 
 ---
 
+## 4. ¿Qué pasa con los datos ENTRE dos envíos LoRa?
+
+**Respuesta corta: NO se promedian ni se acumulan. Se envía el ÚLTIMO valor
+instantáneo**, leído en el mismo ciclo en que toca transmitir.
+
+### Cómo funciona el lazo (`src/main.c`)
+Cada **5 s** (`SENSOR_PERIOD_S`) el lazo hace, en orden:
+1. `memset(payload, 0)` → borra el paquete.
+2. Lee BM688, ZE15-CO y SEN65 y **sobrescribe** el `payload` con esas lecturas.
+3. Publica al portal (`portal_update_sensors`) → el dashboard se ve "vivo".
+4. **Solo si han pasado 180 s** (`LORA_PERIOD_S`): `lorawan_send(payload)`.
+
+Como el `payload` se **rellena de cero en cada ciclo de 5 s** y el envío ocurre
+*dentro de ese mismo ciclo*, lo que viaja por LoRa es **la lectura tomada justo
+en ese ciclo de envío** (antigüedad ~milisegundos). 
+
+### Qué pasa con las lecturas intermedias
+Entre dos envíos (180 s) hay **~36 lecturas** (una cada 5 s). De ellas:
+- **Todas** alimentan el **dashboard del portal** (ahí sí ves el dato cada 5 s,
+  con su mini-gráfico histórico en el navegador).
+- Para **LoRa, 35 se descartan** y solo se transmite la #36 (la del momento de
+  enviar). No hay promedio, ni mínimo/máximo, ni suma.
+
+```
+t(s):   0    5    10   ...   170  175  180   ...
+lee:    L0   L1   L2         L34  L35  L36          (cada 5 s, va al portal)
+LoRa:   ----------- nada -----------         TX(L36)   <- solo el ultimo
+```
+
+### Matices por sensor (qué es ese "último valor")
+- **BM688**: mide *on-demand* (forced) en cada lectura → valor **fresco** del ciclo.
+- **ZE15-CO**: responde a la consulta Q&A → valor **actual** del ciclo.
+- **SEN65**: mide en continuo (1 s); el firmware toma su **última muestra**. Si no
+  hay una nueva lista, el sensor devuelve la anterior (la "retiene").
+- Si un sensor **falla justo en el ciclo de envío**, sus bytes van a 0 y su flag
+  a 0 — aunque hubiera funcionado en ciclos intermedios.
+
+### ¿Y si quisieras promediar?
+No está hecho, pero es un cambio pequeño: acumular cada lectura de 5 s en sumas
+y enviar el promedio (o min/máx) cada 180 s. Útil para suavizar ruido (p.ej.
+PM o CO). Pídelo y se implementa.
+
+---
+
 ## Anexo — Capacidad de dispositivos en el portal (no afecta al envío LoRa)
 Se ampliaron los límites del portal cautivo: **pool DHCP a 10 IPs** y **4
 clientes HTTP**. El SoftAP del ESP32-S3 topa en **10 estaciones**; el driver de
