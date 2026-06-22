@@ -1,5 +1,7 @@
 # BM688 Integration — T3-S3 V1.3 / Zephyr RTOS
 
+> 🔌 Cableado y pines: ver [PINOUT_SENSORES.md](PINOUT_SENSORES.md).
+
 ## 1. Descripción del módulo BM688
 
 El **Bosch BM688** es un sensor ambiental 4-en-1 que mide:

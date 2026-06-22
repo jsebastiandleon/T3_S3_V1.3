@@ -1,5 +1,7 @@
 # ZE15-CO Integration — T3-S3 V1.3 / Zephyr RTOS
 
+> 🔌 Cableado y pines: ver [PINOUT_SENSORES.md](PINOUT_SENSORES.md).
+
 Integración del módulo electroquímico de monóxido de carbono **Winsen ZE15-CO**
 sobre la rama `feat/module_CO` (derivada de `feature/BM688`).
 Datasheet: https://www.winsen-sensor.com/d/files/ZE15-CO.pdf (v1.1, 2018-04-12).

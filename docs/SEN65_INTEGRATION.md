@@ -1,5 +1,7 @@
 # SEN65 Integration — T3-S3 V1.3 / Zephyr RTOS
 
+> 🔌 Cableado y pines: ver [PINOUT_SENSORES.md](PINOUT_SENSORES.md).
+
 Integración del nodo de calidad de aire **Sensirion SEN65** (familia SEN6x)
 sobre la rama `feature/Sensirion`.
 Datasheet: https://www.farnell.com/datasheets/4601635.pdf (SEN6x, v0.91, ago-2025).

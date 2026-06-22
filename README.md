@@ -11,7 +11,23 @@ https://es.farnell.com/sensirion/sen65-sin-t/m-dulo-de-sensor-digital-i2c/dp/478
 
 ## Documentación
 
+**Hardware / cableado**
+- 🔌 [**Pinout — sensores ↔ ESP32-S3**](docs/PINOUT_SENSORES.md) — tabla de asignación de pines, buses, alimentación y ubicación física. **Empezar aquí para cablear.**
+
+**Integración de sensores**
+- [Integración BM688](docs/BM688_INTEGRATION.md) — ambiental (T/H/P/gas), I2C0.
+- [Integración ZE15-CO](docs/ZE15_CO_INTEGRATION.md) — monóxido de carbono, UART1.
+- [Integración SEN65](docs/SEN65_INTEGRATION.md) — calidad de aire (PM/VOC/NOx/RH&T), I2C1.
+
+**Mensaje LoRa / ChirpStack**
+- [Flujo de datos y mensaje LoRa](docs/FLUJO_DATOS_LORA.md) — visión end-to-end sensores → LoRa → ChirpStack.
+- [Envío de sensores](docs/envio_sensores.md) — conformación del mensaje, decodificación, tiempos mínimos y qué pasa con los datos entre envíos.
+- [Payload + decoder](docs/PAYLOAD_DECODER.md) — tabla del payload (29 B), decoder JS y alta en ChirpStack.
+
+**Portal cautivo**
 - [Portal cautivo WiFi](docs/PORTAL_CAUTIVO.md) — arquitectura, configuración y build del AP + dashboard web concurrente con LoRaWAN.
 - [Manual de usuario del portal](docs/MANUAL_USUARIO_PORTAL.md) — cómo conectarse a la red y abrir la página (usuario final).
 - [Actualizar el HTML por LoRa](docs/ACTUALIZAR_HTML_LORA.md) — cambiar la página servida vía downlink LoRaWAN (FPort 10).
-- [Integración BM688](docs/BM688_INTEGRATION.md) · [Integración ZE15-CO](docs/ZE15_CO_INTEGRATION.md)
+
+**Diagnóstico**
+- [Debug BM688 + LoRaWAN](docs/DEBUG_BM688_LORAWAN.md)
