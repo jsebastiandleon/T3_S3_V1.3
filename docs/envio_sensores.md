@@ -93,35 +93,55 @@ Comprobación de un campo: bytes `8f 0a` (offset 1–2) → LE `0x0A8F` = 2703 �
 > los sensores podrías enviar hasta cada 5 s. La única espera "de una vez" es el
 > calentamiento de ~1 min para que VOC/NOx sean válidos al arrancar.
 
-### 3.3 El límite real: duty-cycle de LoRaWAN (EU868, 1 %)
-El tiempo mínimo entre envíos **no lo ponen los sensores, lo pone la radio**. En
-EU868 cada sub-banda permite transmitir solo el **1 %** del tiempo, así que:
+### 3.3 Todas las condiciones que limitan el intervalo
+El mínimo real = **la más estricta** de TODAS estas (el cuello de botella):
+
+| # | Condición | Mínimo que impone | ¿Manda? |
+|---|---|---|---|
+| 1 | **Lazo de firmware** (`SENSOR_PERIOD_S=5 s`): el envío se evalúa cada 5 s | **5 s** (los envíos quedan cuantizados a múltiplos de 5 s) | piso duro |
+| 2 | **Frescura de datos**: el micro lee los 3 sensores cada 5 s | 5 s (+ ~60 s de warm-up de VOC/NOx, **una sola vez** al arrancar) | no |
+| 3 | **Ventanas RX**: tras cada uplink se abren RX1 (~1 s) y RX2 (~2 s) antes de poder transmitir otro | ~2 s | no |
+| 4 | **Duty-cycle EU868 (1 %)**: `intervalo ≥ ToA × 100`, y el ToA depende del SF/DR | **9 s (SF7) … 214 s (SF12)** | **SÍ, domina** |
+
+Regla: **mínimo = max(condiciones)** → siempre gana el **duty-cycle (4)**, porque
+hasta su mejor caso (9 s a SF7) ya supera el piso de firmware (5 s).
+
+### 3.4 El límite dominante: duty-cycle de LoRaWAN (EU868, 1 %)
+EU868 permite transmitir solo el **1 %** del tiempo por sub-banda:
 
 > **intervalo mínimo = tiempo_en_aire (ToA) ÷ 0.01 = ToA × 100**
 
-El ToA depende del **Spreading Factor** (Data Rate). Para nuestro payload de
-29 B (≈42 B en PHY: +13 B de cabecera LoRaWAN), BW125, CR 4/5:
+El ToA depende del **Spreading Factor** (DR). Para el payload de 29 B (≈42 B en
+PHY: +13 B de cabecera LoRaWAN), BW125, CR 4/5; última columna ya cuantizada al
+lazo de 5 s:
 
-| DR | SF | ToA aprox. | **Intervalo mínimo (1 %)** |
-|---|---|---|---|
-| DR5 | SF7 | ~87 ms | **~9 s** |
-| DR4 | SF8 | ~154 ms | ~15 s |
-| DR3 | SF9 | ~288 ms | ~29 s |
-| DR2 | SF10 | ~534 ms | ~53 s |
-| DR1 | SF11 | ~1.15 s | ~115 s |
-| DR0 | SF12 | ~2.14 s | **~214 s** |
+| DR | SF | ToA aprox. | Mínimo duty-cycle | **Mínimo efectivo (lazo 5 s)** |
+|---|---|---|---|---|
+| DR5 | SF7 | ~87 ms | ~9 s | **~10 s** |
+| DR4 | SF8 | ~154 ms | ~15 s | ~15 s |
+| DR3 | SF9 | ~288 ms | ~29 s | ~30 s |
+| DR2 | SF10 | ~534 ms | ~53 s | ~55 s |
+| DR1 | SF11 | ~1.15 s | ~115 s | ~115 s |
+| DR0 | **SF12** | ~2.14 s | ~214 s | **~215 s** |
 
-### 3.4 Conclusión — tiempo mínimo para enviar
-- **Limitado por sensores:** ~5 s (y ~1 min de calentamiento inicial para VOC/NOx).
-- **Limitado por el duty-cycle (lo que manda):**
-  - A **SF12 (peor caso, máximo alcance):** ~**214 s**. Nuestro `LORA_PERIOD_S=180 s`
-    queda *justo por debajo*; pinneado a SF12 podría dar algún `-111` (duty-cycle).
-    Si vas a forzar SF12, pon **≥ 215 s** (p.ej. 240 s).
-  - **Con ADR activo** (lo normal): el server baja el SF y el mínimo cae rápido —
-    a SF9 ~29 s, a SF7 ~9 s. Ahí 180 s sobra y hasta podrías bajarlo.
-- **Recomendación práctica:** dejar **180 s** con ADR (equilibrio alcance/consumo);
-  si necesitas más frecuencia, espera a que ADR suba el DR y baja `LORA_PERIOD_S`
-  vigilando que no aparezca `SEND ERR: -111`.
+### 3.5 Conclusión — tiempo mínimo considerando todo
+El nodo **arranca siempre en SF12/DR0** hasta que el ADR lo baje, así que:
+
+- **Mínimo SIEMPRE seguro** (peor caso SF12, sin asumir nada): **≈ 215 s**
+  → usar **240 s** con margen. Es el único valor que **nunca** dará `SEND ERR: -111`.
+- **Mínimo alcanzable con ADR + buen enlace** (SF7): **≈ 10 s** (ya limitado por
+  el lazo de 5 s, no por la radio).
+- **Piso absoluto del firmware** (aunque el duty-cycle fuese infinito): **5 s**.
+
+**En una frase:** el tiempo mínimo lo fija el **duty-cycle del 1 % al SF actual**
+(de ~10 s a SF7 a ~215 s a SF12); como el nodo empieza en SF12, el valor
+**garantizado-seguro es ~215 s** (recomendado 240 s) y con ADR puede bajar hasta
+~10 s vigilando que no aparezca `-111`.
+
+> El `LORA_PERIOD_S = 180 s` actual funciona con ADR (que saca al nodo de SF12
+> rápido), pero queda *por debajo* del seguro a SF12 (~215 s): justo tras el join,
+> antes de que el ADR actúe, podría aparecer algún `-111` puntual. Para
+> robustez total a cualquier SF, subir a **240 s**.
 
 > Nota: los ToA son aproximados (dependen de cabecera, FOpts y DR exactos). Para
 > el valor fino usa una calculadora de airtime LoRaWAN con 42 B de PHY payload.
