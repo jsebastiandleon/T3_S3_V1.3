@@ -18,11 +18,12 @@ https://es.farnell.com/sensirion/sen65-sin-t/m-dulo-de-sensor-digital-i2c/dp/478
 - [Integración BM688](docs/BM688_INTEGRATION.md) — ambiental (T/H/P/gas), I2C0.
 - [Integración ZE15-CO](docs/ZE15_CO_INTEGRATION.md) — monóxido de carbono, UART1.
 - [Integración SEN65](docs/SEN65_INTEGRATION.md) — calidad de aire (PM/VOC/NOx/RH&T), I2C1.
+- [Integración anemómetro](docs/ANEMOMETER_INTEGRATION.md) — velocidad + dirección de viento, RS485/Modbus, UART2.
 
 **Mensaje LoRa / ChirpStack**
 - [Flujo de datos y mensaje LoRa](docs/FLUJO_DATOS_LORA.md) — visión end-to-end sensores → LoRa → ChirpStack.
 - [Envío de sensores](docs/envio_sensores.md) — conformación del mensaje, decodificación, tiempos mínimos y qué pasa con los datos entre envíos.
-- [Payload + decoder](docs/PAYLOAD_DECODER.md) — tabla del payload (29 B), decoder JS y alta en ChirpStack.
+- [Payload + decoder](docs/PAYLOAD_DECODER.md) — tabla del payload (33 B), decoder JS y alta en ChirpStack.
 
 **Portal cautivo**
 - [Portal cautivo WiFi](docs/PORTAL_CAUTIVO.md) — arquitectura, configuración y build del AP + dashboard web concurrente con LoRaWAN.

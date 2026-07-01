@@ -8,6 +8,7 @@
 #include "sensors/bm688.h"
 #include "sensors/ze15_co.h"
 #include "sensors/sen6x.h"
+#include "sensors/anemometer.h"
 #include "portal/portal.h"
 
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
@@ -75,6 +76,7 @@ static void i2c1_scan(void)
 #define FLAG_CO_OK     0x02
 #define FLAG_CO_FAULT  0x04
 #define FLAG_SEN65_OK  0x08
+#define FLAG_WIND_OK   0x10
 
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
@@ -124,6 +126,17 @@ int main(void)
         printk("SEN65 INIT ERR: %d (continua sin sensor)\n", sen65_ok);
     } else {
         printk("SEN65 READY\n");
+    }
+    /* ------------------------------------------------------------------ */
+
+    /* ---- Anemometro (velocidad + direccion de viento) via RS485 ----- */
+    /* UART2 (TX=GPIO39, RX=GPIO38) + adaptador RS485<->TTL. Modbus RTU. */
+    const struct device *wind_dev = NULL;
+    int wind_ok = anemometer_init(&wind_dev);
+    if (wind_ok < 0) {
+        printk("ANEMOMETRO INIT ERR: %d (continua sin sensor)\n", wind_ok);
+    } else {
+        printk("ANEMOMETRO READY\n");
     }
     /* ------------------------------------------------------------------ */
 
@@ -223,10 +236,11 @@ int main(void)
     printk("JOINED!\n");
 
     /*
-     * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
-     * Incluye TODOS los datos medibles de los 3 sensores + flags de estado.
+     * Payload LoRaWAN v3 (33 bytes, little-endian, FPort 2).
+     * Incluye TODOS los datos medibles de los 4 sensores + flags de estado.
      * (Ver el decoder de ChirpStack en docs/PAYLOAD_DECODER.md.)
-     *   [0]     uint8  flags: bit0 BM688 ok, bit1 CO ok, bit2 CO fault, bit3 SEN65 ok
+     *   [0]     uint8  flags: bit0 BM688 ok, bit1 CO ok, bit2 CO fault,
+     *                         bit3 SEN65 ok, bit4 anemometro ok
      *   --- BM688 (ambiental) --------------------------------------------
      *   [1-2]   int16  temperatura  × 100  (°C)
      *   [3-4]   uint16 humedad      × 100  (%RH)
@@ -243,6 +257,9 @@ int main(void)
      *   [23-24] int16  temp SEN65    × 100 (°C)
      *   [25-26] uint16 VOC index    × 10
      *   [27-28] uint16 NOx index    × 10
+     *   --- Anemometro (viento) ------------------------------------------
+     *   [29-30] uint16 velocidad    × 10   (m/s)
+     *   [31-32] uint16 direccion           (grados 0-359)
      * Los campos de un sensor ausente van a 0 (consultar los flags en byte 0).
      */
     struct {
@@ -260,6 +277,8 @@ int main(void)
         int16_t  sen_temp_cdeg;
         uint16_t voc_x10;
         uint16_t nox_x10;
+        uint16_t wind_speed_x10;
+        uint16_t wind_dir_deg;
     } __packed payload;
 
     /* Snapshot que se publica al portal en cada ciclo. */
@@ -293,6 +312,7 @@ int main(void)
         ps.bm688_valid = false;
         ps.co_valid    = false;
         ps.sen65_valid = false;
+        ps.wind_valid  = false;
 
         /* BM688 (si esta presente) */
         if (bm688_dev != NULL) {
@@ -363,6 +383,22 @@ int main(void)
                 ps.sen65_hum   = ad.humidity;
             } else {
                 printk("SEN65 READ ERR: %d\n", ar);
+            }
+        }
+
+        /* Anemometro (si esta presente): velocidad + direccion via RS485. */
+        if (wind_dev != NULL) {
+            struct anemometer_data wd;
+            int wr = anemometer_read(wind_dev, &wd);
+            if (wr == 0) {
+                payload.wind_speed_x10 = (uint16_t)(wd.wind_speed_ms * 10.0);
+                payload.wind_dir_deg   = wd.wind_dir_deg;
+                payload.flags |= FLAG_WIND_OK;
+                ps.wind_valid    = true;
+                ps.wind_speed_ms = wd.wind_speed_ms;
+                ps.wind_dir_deg  = wd.wind_dir_deg;
+            } else {
+                printk("ANEMOMETRO READ ERR: %d\n", wr);
             }
         }
 

@@ -1,7 +1,7 @@
-# Payload LoRaWAN + Decoder — T3-S3 (BM688 + ZE15-CO + SEN65)
+# Payload LoRaWAN + Decoder — T3-S3 (BM688 + ZE15-CO + SEN65 + anemómetro)
 
 Nodo multisensor de calidad de aire. Uplink LoRaWAN (EU868, OTAA, **FPort 2**,
-**unconfirmed**, **ADR on**). Payload **v2**: binario, little-endian, **29 bytes**.
+**unconfirmed**, **ADR on**). Payload **v3**: binario, little-endian, **33 bytes**.
 
 **DevEUI = MAC del ESP32** (eFuse), derivada en runtime y cargada sola en cada
 arranque (EUI-64 estándar insertando `FF FE`). Se imprime en el log de boot como
@@ -53,13 +53,26 @@ payload ASCII `"SOS"` (3 B); el decoder lo devuelve como
 > El SEN65 también puede dar **número de partículas** (PM0.5/1/2.5/4/10 part/cm³)
 > con el comando 0x0316; no se lee por ahora (la masa µg/m³ es lo estándar).
 
+### Anemómetro integrado (velocidad + dirección) — RS485 Modbus RTU, UART2
+| Magnitud | Unidad | Notas |
+|---|---|---|
+| Velocidad del viento | m/s | rango 0–60 (arranque ≤0.3 m/s) |
+| Dirección del viento | ° | 0–360 (0 = Norte) |
+
+> Salida **RS485 / Modbus RTU** (esclavo `0x01`, función `0x03`). Se conecta al
+> ESP32-S3 mediante un **adaptador RS485↔TTL** en UART2 (TX=GPIO39, RX=GPIO38,
+> DE/RE=GPIO42 opcional). Alimentación **5–24 V DC** (fuente externa). El **mapa
+> de registros por defecto** (baudrate 4800, velocidad en reg 0x0000 ÷10 m/s,
+> dirección en reg 0x0001 en grados) es **ajustable** en `src/sensors/anemometer.c`
+> si el sensor real difiere. Ver `docs/ANEMOMETER_INTEGRATION.md`.
+
 ---
 
-## 2. Formato del mensaje (payload v2, 29 bytes, little-endian)
+## 2. Formato del mensaje (payload v3, 33 bytes, little-endian)
 
 | Offset | Tipo | Campo | Escala → unidad |
 |---|---|---|---|
-| 0 | uint8 | **flags** | bit0 BM688 ok · bit1 CO ok · bit2 CO fault · bit3 SEN65 ok |
+| 0 | uint8 | **flags** | bit0 BM688 ok · bit1 CO ok · bit2 CO fault · bit3 SEN65 ok · bit4 anemómetro ok |
 | 1–2 | int16 | BM688 temperatura | ÷100 → °C |
 | 3–4 | uint16 | BM688 humedad | ÷100 → %RH |
 | 5–6 | uint16 | BM688 presión | ÷10 → hPa |
@@ -73,6 +86,8 @@ payload ASCII `"SOS"` (3 B); el decoder lo devuelve como
 | 23–24 | int16 | SEN65 temperatura | ÷100 → °C |
 | 25–26 | uint16 | VOC index | ÷10 |
 | 27–28 | uint16 | NOx index | ÷10 |
+| 29–30 | uint16 | Velocidad viento | ÷10 → m/s |
+| 31–32 | uint16 | Dirección viento | → ° (0–359) |
 
 Los campos de un sensor ausente van a **0**; usar **flags** (byte 0) para saber
 qué es válido. No hay CRC de aplicación: LoRaWAN ya protege la trama (MIC).
@@ -93,11 +108,12 @@ en **Device Profile → Codec → JavaScript functions**. Resumen de la salida:
 
 ```json
 {
-  "status": { "bm688": true, "ze15co": true, "ze15co_fault": false, "sen65": true },
+  "status": { "bm688": true, "ze15co": true, "ze15co_fault": false, "sen65": true, "anemometer": true },
   "bm688":  { "temperature_c": 26.68, "humidity_pct": 44.1, "pressure_hpa": 1008.9, "gas_resistance_ohm": 85000 },
   "ze15co": { "co_ppm": 0.5 },
   "sen65":  { "pm1p0_ugm3": 8.7, "pm2p5_ugm3": 9.1, "pm4p0_ugm3": 9.1, "pm10_ugm3": 9.1,
-              "humidity_pct": 40.0, "temperature_c": 26.7, "voc_index": 56.0, "nox_index": 1.0 }
+              "humidity_pct": 40.0, "temperature_c": 26.7, "voc_index": 56.0, "nox_index": 1.0 },
+  "anemometer": { "wind_speed_ms": 5.2, "wind_dir_deg": 180 }
 }
 ```
 

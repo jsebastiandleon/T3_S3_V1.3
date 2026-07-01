@@ -39,6 +39,9 @@ struct portal_sensors {
 	double  nox_index;       /* indice NOx      */
 	double  sen65_temp;      /* grados C (SEN65)*/
 	double  sen65_hum;       /* %RH (SEN65)     */
+	bool    wind_valid;
+	double   wind_speed_ms;  /* m/s (anemometro)*/
+	uint16_t wind_dir_deg;   /* grados 0-359    */
 	int64_t updated_uptime_ms;
 };
 

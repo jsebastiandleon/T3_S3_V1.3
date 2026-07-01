@@ -1,7 +1,7 @@
 /*
  * ChirpStack v4 — Codec (Device Profile > Codec > JavaScript functions).
- * Decoder para el payload v2 (29 bytes, FPort 2) del nodo T3-S3
- * (BM688 + ZE15-CO + SEN65). Ver docs/PAYLOAD_DECODER.md.
+ * Decoder para el payload v3 (33 bytes, FPort 2) del nodo T3-S3
+ * (BM688 + ZE15-CO + SEN65 + anemometro). Ver docs/PAYLOAD_DECODER.md.
  *
  * DevEUI de pruebas: 1CDBD4FFFEBD2965
  */
@@ -14,8 +14,8 @@ function decodeUplink(input) {
     return { data: { alert: "SOS", source: "panic_button" } };
   }
 
-  if (b.length < 29) {
-    return { errors: ["payload demasiado corto: " + b.length + " (esperado 29)"] };
+  if (b.length < 33) {
+    return { errors: ["payload demasiado corto: " + b.length + " (esperado 33)"] };
   }
 
   // Helpers little-endian
@@ -28,13 +28,15 @@ function decodeUplink(input) {
   var coOk  = (flags & 0x02) !== 0;
   var coFlt = (flags & 0x04) !== 0;
   var senOk = (flags & 0x08) !== 0;
+  var wndOk = (flags & 0x10) !== 0;
 
   var data = {
     status: {
       bm688: bmOk,
       ze15co: coOk,
       ze15co_fault: coFlt,
-      sen65: senOk
+      sen65: senOk,
+      anemometer: wndOk
     }
   };
 
@@ -66,6 +68,14 @@ function decodeUplink(input) {
       temperature_c: s16(23) / 100,       // grados C
       voc_index:     u16(25) / 10,        // indice (1..500, ~100 nominal)
       nox_index:     u16(27) / 10         // indice (1..500, ~1 en aire limpio)
+    };
+  }
+
+  // --- Anemometro (velocidad + direccion de viento) ---
+  if (wndOk) {
+    data.anemometer = {
+      wind_speed_ms: u16(29) / 10,        // m/s
+      wind_dir_deg:  u16(31)              // grados (0..359, 0 = Norte)
     };
   }
 

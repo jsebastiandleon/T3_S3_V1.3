@@ -15,6 +15,7 @@ target_sources(app PRIVATE
     src/sensors/bm688.c
     src/sensors/ze15_co.c
     src/sensors/sen6x.c
+    src/sensors/anemometer.c
     src/portal/portal.c
     src/portal/portal_html.c
     src/portal/captive_dns.c

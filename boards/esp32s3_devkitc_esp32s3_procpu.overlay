@@ -184,7 +184,44 @@
 };
 
 /* =========================
- * ALIAS
+ * PINCTRL: UART2 para el ANEMOMETRO (RS485/Modbus) en GPIO39 (TX) y GPIO38 (RX)
+ * Pines libres del header derecho, sin funcion de strapping.
+ * NO se usan 43/44 (UART0/ROM = printk), 40/41 (UART1/ZE15-CO) ni 47/48 (I2C0).
+ * El TX del ESP32 va al DI del adaptador RS485<->TTL; el RX al RO.
+ * ========================= */
+&pinctrl {
+    uart2_wind: uart2_wind {
+        group1 {
+            pinmux = <UART2_TX_GPIO39>;
+            output-high;
+        };
+        group2 {
+            pinmux = <UART2_RX_GPIO38>;
+            bias-pull-up;
+        };
+    };
+};
+
+/* =========================
+ * UART2 + ANEMOMETRO (velocidad + direccion de viento) via RS485/Modbus RTU
+ * 4800 8N1 por defecto (AJUSTABLE: muchos vienen a 9600). Half-duplex: el
+ * driver conmuta DE/RE (GPIO42) alrededor del TX; si el adaptador RS485<->TTL
+ * es de conmutacion automatica, dejar wind-de-gpios sin cablear.
+ *
+ * OJO HARDWARE: sensor a 5~24V DC (rojo +, negro GND); salida RS485 A(amarillo)
+ * y B(verde) a los bornes A/B del adaptador. Masa comun con el ESP32. La logica
+ * TTL del adaptador es 3.3V (usar un modulo alimentado a 3.3V, no a 5V, para no
+ * meter 5V en el RX del ESP32).
+ * ========================= */
+&uart2 {
+    status = "okay";
+    current-speed = <4800>;
+    pinctrl-0 = <&uart2_wind>;
+    pinctrl-names = "default";
+};
+
+/* =========================
+ * ALIAS + nodo zephyr,user (GPIO de direccion RS485)
  * ========================= */
 &{/} {
     aliases {
@@ -192,5 +229,12 @@
         bme688-sensor = &bme688;
         co-uart     = &uart1;
         sen65-sensor = &sen65;
+        wind-uart   = &uart2;
+    };
+
+    zephyr,user {
+        /* DE+RE del adaptador RS485 en GPIO42 (= gpio1 pin 10, 42-32=10).
+           OPCIONAL: borrar esta linea si el adaptador conmuta solo. */
+        wind-de-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
     };
 };

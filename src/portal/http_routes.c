@@ -65,7 +65,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			   struct http_response_ctx *rsp, void *user_data)
 {
 	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(user_data);
-	static char json[384];
+	static char json[448];
 
 	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
 		struct portal_sensors s;
@@ -90,6 +90,8 @@ static int sensors_handler(struct http_client_ctx *client,
 		int p10_i = (int)s.pm10_0; int p10_f = (int)(s.pm10_0 * 10) % 10;
 		int st_i  = (int)s.sen65_temp; int st_f = (int)(s.sen65_temp * 100) % 100; if (st_f < 0) st_f = -st_f;
 		int sh_i  = (int)s.sen65_hum;  int sh_f = (int)(s.sen65_hum * 100) % 100;  if (sh_f < 0) sh_f = -sh_f;
+		/* Anemometro: velocidad (1 decimal) y direccion (grados enteros). */
+		int ws_i  = (int)s.wind_speed_ms; int ws_f = (int)(s.wind_speed_ms * 10) % 10; if (ws_f < 0) ws_f = -ws_f;
 
 		int len = snprintf(json, sizeof(json),
 			"{\"bm688\":%s,\"temperature\":%d.%02d,\"humidity\":%d.%02d,"
@@ -98,6 +100,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			"\"sen65\":%s,\"pm1_0\":%d.%d,\"pm2_5\":%d.%d,"
 			"\"pm4_0\":%d.%d,\"pm10_0\":%d.%d,\"voc\":%d,\"nox\":%d,"
 			"\"s_temp\":%d.%02d,\"s_hum\":%d.%02d,"
+			"\"wind\":%s,\"wind_speed\":%d.%d,\"wind_dir\":%d,"
 			"\"age_ms\":%lld}",
 			s.bm688_valid ? "true" : "false", t_i, t_f, h_i, h_f,
 			(int)s.pressure, (int)s.gas_resistance,
@@ -106,6 +109,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			p1_i, p1_f, p25_i, p25_f, p4_i, p4_f, p10_i, p10_f,
 			(int)s.voc_index, (int)s.nox_index,
 			st_i, st_f, sh_i, sh_f,
+			s.wind_valid ? "true" : "false", ws_i, ws_f, (int)s.wind_dir_deg,
 			(long long)age);
 
 		rsp->status = HTTP_200_OK;
