@@ -76,6 +76,26 @@ static void i2c1_scan(void)
 #define FLAG_CO_FAULT  0x04
 #define FLAG_SEN65_OK  0x08
 
+/* =======================================================================
+ *  CONFIGURACION DE TIEMPOS  <-- CAMBIA AQUI EL INTERVALO DE ENVIO
+ * =======================================================================
+ * LORA_SEND_PERIOD_S: cada cuantos SEGUNDOS se envia el uplink a ChirpStack.
+ *   Es el unico valor que hay que tocar para controlar la cadencia de envio.
+ *
+ *   OJO duty-cycle EU868 (1%): a SF12 un uplink de ~29 B dura ~1.5 s de
+ *   airtime, lo que obliga a >=~150 s entre paquetes. Si pones menos, el
+ *   stack devuelve "SEND ERR: -111" (duty-cycle) y NO envia. 180 s es el
+ *   valor conservador (aguanta incluso SF12). Cuando el ADR sube el DR a
+ *   SF7 (~70 ms de airtime) se podria bajar bastante con seguridad.
+ *
+ * SENSOR_READ_PERIOD_S: cada cuantos segundos se LEEN los sensores (y se
+ *   refresca el dashboard del portal). El uplink LoRa NO envia la ultima
+ *   lectura, sino el PROMEDIO de todas las lecturas tomadas dentro de la
+ *   ventana de envio (LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S muestras).
+ * ======================================================================= */
+#define LORA_SEND_PERIOD_S    180
+#define SENSOR_READ_PERIOD_S  5
+
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
 {
@@ -225,6 +245,8 @@ int main(void)
     /*
      * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
      * Incluye TODOS los datos medibles de los 3 sensores + flags de estado.
+     * Cada campo es el PROMEDIO de las lecturas tomadas en la ventana de
+     * envio (ver acumuladores 'acc' mas abajo), no la ultima lectura.
      * (Ver el decoder de ChirpStack en docs/PAYLOAD_DECODER.md.)
      *   [0]     uint8  flags: bit0 BM688 ok, bit1 CO ok, bit2 CO fault, bit3 SEN65 ok
      *   --- BM688 (ambiental) --------------------------------------------
@@ -262,20 +284,31 @@ int main(void)
         uint16_t nox_x10;
     } __packed payload;
 
-    /* Snapshot que se publica al portal en cada ciclo. */
+    /* Snapshot que se publica al portal en cada ciclo (lectura instantanea). */
     struct portal_sensors ps;
 
     /*
-     * Cadencias DESACOPLADAS:
-     *  - Sensores + portal: cada SENSOR_PERIOD_S -> dashboard "vivo" en el AP,
-     *    independiente de la radio.
-     *  - Envio LoRa: cada LORA_PERIOD_S. En EU868 a DR0/SF12 un uplink de ~27 B
-     *    dura ~1.5 s de airtime; el 1% de duty-cycle obliga a ~150 s entre
-     *    paquetes. Enviar mas a menudo solo produce -EMSGSIZE/duty-cycle (-111).
-     *    Cuando el ADR suba el DR, podra acelerarse solo.
+     * Acumuladores para el PROMEDIO del uplink. Cada lectura valida suma aqui;
+     * al enviar se divide entre el nº de muestras (bm_n/co_n/sen_n) y se
+     * resetea la ventana. Asi el uplink lleva la media del periodo, no la
+     * ultima foto. El portal sigue mostrando la lectura instantanea (ps).
+     *
+     * Cadencias DESACOPLADAS: sensores/portal cada SENSOR_READ_PERIOD_S;
+     * envio LoRa cada LORA_SEND_PERIOD_S (ver la CONFIGURACION DE TIEMPOS
+     * arriba del fichero para cambiarlas).
      */
-    const int SENSOR_PERIOD_S = 5;
-    const int LORA_PERIOD_S   = 180;
+    struct {
+        double   temp_sum, hum_sum, press_sum, gas_sum; /* BM688 */
+        uint32_t bm_n;
+        double   co_sum;                                /* ZE15-CO */
+        uint32_t co_n;
+        bool     co_fault_seen;
+        double   pm1_sum, pm25_sum, pm4_sum, pm10_sum;  /* SEN65 */
+        double   shum_sum, stemp_sum, voc_sum, nox_sum;
+        uint32_t sen_n;
+    } acc;
+    memset(&acc, 0, sizeof(acc));
+
     int64_t last_send_ms = 0;
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
@@ -289,21 +322,20 @@ int main(void)
             printk("SOS enviado (FPort 3): %d\n", sret);
         }
 
-        memset(&payload, 0, sizeof(payload));
         ps.bm688_valid = false;
         ps.co_valid    = false;
         ps.sen65_valid = false;
 
-        /* BM688 (si esta presente) */
+        /* BM688 (si esta presente): suma al acumulador + snapshot al portal. */
         if (bm688_dev != NULL) {
             struct bm688_data sd;
             int r = bm688_read_data(bm688_dev, &sd);
             if (r == 0) {
-                payload.bm_temp_cdeg  = (int16_t)(sd.temperature * 100.0);
-                payload.bm_hum_cpct   = (uint16_t)(sd.humidity   * 100.0);
-                payload.bm_press_dhpa = (uint16_t)(sd.pressure / 10.0);
-                payload.bm_gas_ohm    = (uint32_t)(sd.gas_resistance);
-                payload.flags |= FLAG_BM688_OK;
+                acc.temp_sum  += sd.temperature;
+                acc.hum_sum   += sd.humidity;
+                acc.press_sum += sd.pressure;
+                acc.gas_sum   += sd.gas_resistance;
+                acc.bm_n++;
                 ps.bm688_valid    = true;
                 ps.temperature    = sd.temperature;
                 ps.humidity       = sd.humidity;
@@ -321,14 +353,14 @@ int main(void)
             struct ze15co_data cd;
             int cr = ze15co_read(co_dev, &cd);
             if (cr == 0 && !cd.sensor_fault) {
-                payload.co_ppm_x10 = (uint16_t)(cd.co_ppm * 10.0);
-                payload.flags |= FLAG_CO_OK;
+                acc.co_sum += cd.co_ppm;
+                acc.co_n++;
                 ps.co_valid = true;
                 ps.co_ppm   = cd.co_ppm;
                 co_fails = 0;
             } else {
                 if (cr == 0 && cd.sensor_fault) {
-                    payload.flags |= FLAG_CO_FAULT;  /* sensor reporta fallo interno */
+                    acc.co_fault_seen = true;  /* sensor reporta fallo interno */
                 }
                 if (++co_fails >= 3) {
                     printk("ZE15-CO: 3 fallos seguidos, se deshabilita la lectura\n");
@@ -343,15 +375,15 @@ int main(void)
             struct sen6x_data ad;
             int ar = sen6x_read(sen65_dev, &ad);
             if (ar == 0) {
-                payload.pm1_0_x10    = (uint16_t)(ad.pm1_0  * 10.0);
-                payload.pm2_5_x10    = (uint16_t)(ad.pm2_5  * 10.0);
-                payload.pm4_0_x10    = (uint16_t)(ad.pm4_0  * 10.0);
-                payload.pm10_0_x10   = (uint16_t)(ad.pm10_0 * 10.0);
-                payload.sen_hum_cpct  = (uint16_t)(ad.humidity    * 100.0);
-                payload.sen_temp_cdeg = (int16_t)(ad.temperature * 100.0);
-                payload.voc_x10      = (uint16_t)(ad.voc_index * 10.0);
-                payload.nox_x10      = (uint16_t)(ad.nox_index * 10.0);
-                payload.flags |= FLAG_SEN65_OK;
+                acc.pm1_sum   += ad.pm1_0;
+                acc.pm25_sum  += ad.pm2_5;
+                acc.pm4_sum   += ad.pm4_0;
+                acc.pm10_sum  += ad.pm10_0;
+                acc.shum_sum  += ad.humidity;
+                acc.stemp_sum += ad.temperature;
+                acc.voc_sum   += ad.voc_index;
+                acc.nox_sum   += ad.nox_index;
+                acc.sen_n++;
                 ps.sen65_valid = true;
                 ps.pm1_0       = ad.pm1_0;
                 ps.pm2_5       = ad.pm2_5;
@@ -369,9 +401,41 @@ int main(void)
         /* Portal: siempre actualizado (lo sirve /api/sensors). */
         portal_update_sensors(&ps);
 
-        /* LoRa: solo en su cadencia, respetando el duty-cycle. */
+        /* LoRa: solo en su cadencia, respetando el duty-cycle. Se arma el
+           payload con el PROMEDIO de la ventana y se resetea el acumulador. */
         int64_t now = k_uptime_get();
-        if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_PERIOD_S * 1000) {
+        if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_SEND_PERIOD_S * 1000) {
+            memset(&payload, 0, sizeof(payload));
+
+            if (acc.bm_n > 0) {
+                payload.bm_temp_cdeg  = (int16_t)((acc.temp_sum  / acc.bm_n) * 100.0);
+                payload.bm_hum_cpct   = (uint16_t)((acc.hum_sum  / acc.bm_n) * 100.0);
+                payload.bm_press_dhpa = (uint16_t)((acc.press_sum / acc.bm_n) / 10.0);
+                payload.bm_gas_ohm    = (uint32_t)(acc.gas_sum   / acc.bm_n);
+                payload.flags |= FLAG_BM688_OK;
+            }
+            if (acc.co_n > 0) {
+                payload.co_ppm_x10 = (uint16_t)((acc.co_sum / acc.co_n) * 10.0);
+                payload.flags |= FLAG_CO_OK;
+            }
+            if (acc.co_fault_seen) {
+                payload.flags |= FLAG_CO_FAULT;
+            }
+            if (acc.sen_n > 0) {
+                payload.pm1_0_x10     = (uint16_t)((acc.pm1_sum  / acc.sen_n) * 10.0);
+                payload.pm2_5_x10     = (uint16_t)((acc.pm25_sum / acc.sen_n) * 10.0);
+                payload.pm4_0_x10     = (uint16_t)((acc.pm4_sum  / acc.sen_n) * 10.0);
+                payload.pm10_0_x10    = (uint16_t)((acc.pm10_sum / acc.sen_n) * 10.0);
+                payload.sen_hum_cpct  = (uint16_t)((acc.shum_sum / acc.sen_n) * 100.0);
+                payload.sen_temp_cdeg = (int16_t)((acc.stemp_sum / acc.sen_n) * 100.0);
+                payload.voc_x10       = (uint16_t)((acc.voc_sum  / acc.sen_n) * 10.0);
+                payload.nox_x10       = (uint16_t)((acc.nox_sum  / acc.sen_n) * 10.0);
+                payload.flags |= FLAG_SEN65_OK;
+            }
+
+            printk("SEND avg (bm=%u co=%u sen=%u muestras)\n",
+                   acc.bm_n, acc.co_n, acc.sen_n);
+
             ret = lorawan_send(2, (uint8_t *)&payload, sizeof(payload),
                                LORAWAN_MSG_UNCONFIRMED);
             if (ret < 0) {
@@ -381,8 +445,9 @@ int main(void)
                 printk("SEND OK\n");
             }
             last_send_ms = now;
+            memset(&acc, 0, sizeof(acc));   /* nueva ventana de promediado */
         }
 
-        k_sleep(K_SECONDS(SENSOR_PERIOD_S));
+        k_sleep(K_SECONDS(SENSOR_READ_PERIOD_S));
     }
 }

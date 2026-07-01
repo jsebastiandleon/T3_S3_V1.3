@@ -79,8 +79,8 @@ Comprobación de un campo: bytes `8f 0a` (offset 1–2) → LE `0x0A8F` = 2703 �
 ### 3.1 Ritmos del sistema
 | Ritmo | Periodo | Constante |
 |---|---|---|
-| Lectura de los 3 sensores + refresco del portal | **5 s** | `SENSOR_PERIOD_S` |
-| Envío por LoRa | **180 s** | `LORA_PERIOD_S` |
+| Lectura de los 3 sensores + refresco del portal | **5 s** | `SENSOR_READ_PERIOD_S` |
+| Envío por LoRa | **180 s** | `LORA_SEND_PERIOD_S` |
 
 ### 3.2 Muestreo de cada sensor (hacia el micro)
 | Sensor | Muestra interna | Lo lee el firmware | Notas |
@@ -98,7 +98,7 @@ El mínimo real = **la más estricta** de TODAS estas (el cuello de botella):
 
 | # | Condición | Mínimo que impone | ¿Manda? |
 |---|---|---|---|
-| 1 | **Lazo de firmware** (`SENSOR_PERIOD_S=5 s`): el envío se evalúa cada 5 s | **5 s** (los envíos quedan cuantizados a múltiplos de 5 s) | piso duro |
+| 1 | **Lazo de firmware** (`SENSOR_READ_PERIOD_S=5 s`): el envío se evalúa cada 5 s | **5 s** (los envíos quedan cuantizados a múltiplos de 5 s) | piso duro |
 | 2 | **Frescura de datos**: el micro lee los 3 sensores cada 5 s | 5 s (+ ~60 s de warm-up de VOC/NOx, **una sola vez** al arrancar) | no |
 | 3 | **Ventanas RX**: tras cada uplink se abren RX1 (~1 s) y RX2 (~2 s) antes de poder transmitir otro | ~2 s | no |
 | 4 | **Duty-cycle EU868 (1 %)**: `intervalo ≥ ToA × 100`, y el ToA depende del SF/DR | **9 s (SF7) … 214 s (SF12)** | **SÍ, domina** |
@@ -138,7 +138,7 @@ El nodo **arranca siempre en SF12/DR0** hasta que el ADR lo baje, así que:
 **garantizado-seguro es ~215 s** (recomendado 240 s) y con ADR puede bajar hasta
 ~10 s vigilando que no aparezca `-111`.
 
-> El `LORA_PERIOD_S = 180 s` actual funciona con ADR (que saca al nodo de SF12
+> El `LORA_SEND_PERIOD_S = 180 s` actual funciona con ADR (que saca al nodo de SF12
 > rápido), pero queda *por debajo* del seguro a SF12 (~215 s): justo tras el join,
 > antes de que el ADR actúe, podría aparecer algún `-111` puntual. Para
 > robustez total a cualquier SF, subir a **240 s**.
@@ -150,45 +150,53 @@ El nodo **arranca siempre en SF12/DR0** hasta que el ADR lo baje, así que:
 
 ## 4. ¿Qué pasa con los datos ENTRE dos envíos LoRa?
 
-**Respuesta corta: NO se promedian ni se acumulan. Se envía el ÚLTIMO valor
-instantáneo**, leído en el mismo ciclo en que toca transmitir.
+**Respuesta corta: se PROMEDIAN.** El uplink lleva la **media** de todas las
+lecturas tomadas en la ventana de envío, no la última foto instantánea.
 
 ### Cómo funciona el lazo (`src/main.c`)
-Cada **5 s** (`SENSOR_PERIOD_S`) el lazo hace, en orden:
-1. `memset(payload, 0)` → borra el paquete.
-2. Lee BM688, ZE15-CO y SEN65 y **sobrescribe** el `payload` con esas lecturas.
-3. Publica al portal (`portal_update_sensors`) → el dashboard se ve "vivo".
-4. **Solo si han pasado 180 s** (`LORA_PERIOD_S`): `lorawan_send(payload)`.
-
-Como el `payload` se **rellena de cero en cada ciclo de 5 s** y el envío ocurre
-*dentro de ese mismo ciclo*, lo que viaja por LoRa es **la lectura tomada justo
-en ese ciclo de envío** (antigüedad ~milisegundos). 
+Cada **5 s** (`SENSOR_READ_PERIOD_S`) el lazo hace, en orden:
+1. Lee BM688, ZE15-CO y SEN65.
+2. **Suma** cada lectura válida a un acumulador (`acc`) e incrementa su contador
+   (`bm_n` / `co_n` / `sen_n`).
+3. Publica la lectura **instantánea** al portal (`portal_update_sensors`) → el
+   dashboard se ve "vivo" cada 5 s.
+4. **Solo si han pasado `LORA_SEND_PERIOD_S`** (180 s): arma el `payload`
+   dividiendo cada suma entre su contador (**promedio**), lo envía y **resetea el
+   acumulador** para empezar una ventana nueva.
 
 ### Qué pasa con las lecturas intermedias
 Entre dos envíos (180 s) hay **~36 lecturas** (una cada 5 s). De ellas:
-- **Todas** alimentan el **dashboard del portal** (ahí sí ves el dato cada 5 s,
-  con su mini-gráfico histórico en el navegador).
-- Para **LoRa, 35 se descartan** y solo se transmite la #36 (la del momento de
-  enviar). No hay promedio, ni mínimo/máximo, ni suma.
+- **Todas** alimentan el **dashboard del portal** (dato instantáneo cada 5 s, con
+  su mini-gráfico histórico en el navegador).
+- **Todas** entran en el **promedio** que se transmite por LoRa (no se descarta
+  ninguna). Lo que viaja es `suma / nº_muestras` por cada magnitud.
 
 ```
 t(s):   0    5    10   ...   170  175  180   ...
-lee:    L0   L1   L2         L34  L35  L36          (cada 5 s, va al portal)
-LoRa:   ----------- nada -----------         TX(L36)   <- solo el ultimo
+lee:    L0   L1   L2         L34  L35  L36      (cada 5 s -> portal + acumulador)
+LoRa:   --------- acumulando ---------  TX(media L0..L36)  <- promedio, luego reset
 ```
 
-### Matices por sensor (qué es ese "último valor")
-- **BM688**: mide *on-demand* (forced) en cada lectura → valor **fresco** del ciclo.
-- **ZE15-CO**: responde a la consulta Q&A → valor **actual** del ciclo.
-- **SEN65**: mide en continuo (1 s); el firmware toma su **última muestra**. Si no
-  hay una nueva lista, el sensor devuelve la anterior (la "retiene").
-- Si un sensor **falla justo en el ciclo de envío**, sus bytes van a 0 y su flag
-  a 0 — aunque hubiera funcionado en ciclos intermedios.
+El log imprime cuántas muestras entraron en cada envío:
+`SEND avg (bm=36 co=36 sen=36 muestras)`.
 
-### ¿Y si quisieras promediar?
-No está hecho, pero es un cambio pequeño: acumular cada lectura de 5 s en sumas
-y enviar el promedio (o min/máx) cada 180 s. Útil para suavizar ruido (p.ej.
-PM o CO). Pídelo y se implementa.
+### Matices del promedio
+- El flag de cada sensor se pone a 1 si tuvo **al menos una** muestra válida en la
+  ventana; si un sensor falló **todo** el periodo, su promedio no se calcula, sus
+  bytes van a 0 y su flag a 0.
+- **VOC/NOx del SEN65** tardan ~1 min en converger tras arrancar; las primeras
+  muestras (bajas) entran en la media de la primera ventana y la sesgan hacia
+  abajo. A partir de la 2ª ventana ya está estabilizado.
+- El **CO fault** se marca si el sensor reportó fallo en **cualquier** ciclo.
+- La media es aritmética simple (todas las muestras pesan igual). Para magnitudes
+  **angulares** como la dirección de viento (rama del anemómetro) la media
+  aritmética no es correcta cerca de 0°/360°; ahí conviene promedio vectorial
+  (seno/coseno) — a tener en cuenta si se promedia ese campo.
+
+### Cambiar la cadencia de envío
+Editar **`LORA_SEND_PERIOD_S`** (segundos) en el bloque *CONFIGURACION DE TIEMPOS*
+al principio de `src/main.c`. Es el único valor a tocar. Respetar el mínimo por
+duty-cycle de la sección 3 (≈215 s garantizado a SF12; menos solo con ADR).
 
 ---
 

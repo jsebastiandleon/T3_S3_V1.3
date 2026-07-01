@@ -78,11 +78,15 @@ Los campos de un sensor ausente van a **0**; usar **flags** (byte 0) para saber
 qué es válido. No hay CRC de aplicación: LoRaWAN ya protege la trama (MIC).
 
 ### Cómo se conforma (en `src/main.c`)
-Un `struct __packed` con esos campos en ese orden exacto, relleno cada ciclo de
-envío y mandado tal cual con `lorawan_send(2, &payload, sizeof(payload),
-LORAWAN_MSG_UNCONFIRMED)`. La estrategia de envío: **ADR activado** (el server
-baja SF12→SF7), **unconfirmed** (sin ACK), **cadencia 180 s** (respeta el 1 % de
-duty-cycle EU868 incluso en SF12).
+Un `struct __packed` con esos campos en ese orden exacto. Cada campo es el
+**PROMEDIO** de las lecturas tomadas dentro de la ventana de envío (los sensores
+se leen cada `SENSOR_READ_PERIOD_S` y se acumulan; al enviar se divide entre el
+nº de muestras), no la última lectura. Se manda con `lorawan_send(2, &payload,
+sizeof(payload), LORAWAN_MSG_UNCONFIRMED)`. La estrategia de envío: **ADR
+activado** (el server baja SF12→SF7), **unconfirmed** (sin ACK), **cadencia
+`LORA_SEND_PERIOD_S` = 180 s** (respeta el 1 % de duty-cycle EU868 incluso en
+SF12). Para cambiar la cadencia, editar `LORA_SEND_PERIOD_S` (bloque
+*CONFIGURACION DE TIEMPOS* al principio de `src/main.c`).
 
 ---
 
