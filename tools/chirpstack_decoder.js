@@ -9,19 +9,46 @@
 function decodeUplink(input) {
   var b = input.bytes;
 
+  // Helpers little-endian
+  function u16(i) { return b[i] | (b[i + 1] << 8); }
+  function s16(i) { var v = u16(i); return v > 32767 ? v - 65536 : v; }
+  function u32(i) { return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0; }
+
   // FPort 3 = boton de EMERGENCIA (SOS), no datos de sensores.
   if (input.fPort === 3) {
     return { data: { alert: "SOS", source: "panic_button" } };
   }
 
+  // FPort 4 = ALERTA automatica por UMBRAL (threshold). 15 bytes.
+  if (input.fPort === 4) {
+    if (b.length < 15) {
+      return { errors: ["alerta demasiado corta: " + b.length + " (esperado 15)"] };
+    }
+    var m = b[0];
+    return { data: {
+      alert: "THRESHOLD",
+      triggered: {
+        temperature: (m & 0x01) !== 0,
+        co:          (m & 0x02) !== 0,
+        pm2_5:       (m & 0x04) !== 0,
+        pm10:        (m & 0x08) !== 0,
+        voc:         (m & 0x10) !== 0,
+        gas:         (m & 0x20) !== 0
+      },
+      values: {
+        temperature_c:      s16(1) / 100,
+        co_ppm:             u16(3) / 10,
+        pm2p5_ugm3:         u16(5) / 10,
+        pm10_ugm3:          u16(7) / 10,
+        voc_index:          u16(9) / 10,
+        gas_resistance_ohm: u32(11)
+      }
+    }};
+  }
+
   if (b.length < 29) {
     return { errors: ["payload demasiado corto: " + b.length + " (esperado 29)"] };
   }
-
-  // Helpers little-endian
-  function u16(i) { return b[i] | (b[i + 1] << 8); }
-  function s16(i) { var v = u16(i); return v > 32767 ? v - 65536 : v; }
-  function u32(i) { return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0; }
 
   var flags = b[0];
   var bmOk  = (flags & 0x01) !== 0;

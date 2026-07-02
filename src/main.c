@@ -93,8 +93,57 @@ static void i2c1_scan(void)
  *   lectura, sino el PROMEDIO de todas las lecturas tomadas dentro de la
  *   ventana de envio (LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S muestras).
  * ======================================================================= */
-#define LORA_SEND_PERIOD_S    180
+#define LORA_SEND_PERIOD_S    729
 #define SENSOR_READ_PERIOD_S  5
+
+/* =======================================================================
+ *  CANALES (FPorts) — cada tipo de mensaje va por su PROPIO FPort, para
+ *  poder enrutarlos/actuar por separado en ChirpStack.
+ * ======================================================================= */
+#define FPORT_DATA    2   /* datos periodicos (promedio de la ventana)   */
+#define FPORT_SOS     3   /* boton de emergencia del portal cautivo      */
+#define FPORT_ALERT   4   /* alertas automaticas por umbral (threshold)  */
+
+/* =======================================================================
+ *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
+ * =======================================================================
+ * Se comparan contra la lectura INSTANTANEA de cada ciclo (cada
+ * SENSOR_READ_PERIOD_S). Al CRUZAR un umbral se envia UNA alerta por
+ * FPORT_ALERT; NO se reenvia hasta que el valor baje del umbral (con
+ * histeresis) y lo vuelva a cruzar -> asi no se inunda la radio.
+ *
+ * Para DESACTIVAR un umbral, pon su *_EN a 0.
+ * Casi todos son "maximo" (alerta si SUPERA el valor). El gas del BM688 es
+ * al reves: alerta si CAE por DEBAJO del valor (menos ohmios = aire peor).
+ */
+#define TH_TEMP_EN     1
+#define TH_TEMP_MAX    50.0      /* grados C                                  */
+#define TH_CO_EN       1
+#define TH_CO_MAX      35.0      /* ppm  (35 ppm = limite de exposicion 8h)   */
+#define TH_PM25_EN     1
+#define TH_PM25_MAX    55.0      /* ug/m3  (calidad de aire "insalubre")      */
+#define TH_PM10_EN     1
+#define TH_PM10_MAX    150.0     /* ug/m3                                     */
+#define TH_VOC_EN      1
+#define TH_VOC_MAX     250.0     /* indice VOC (nominal ~100)                 */
+#define TH_GAS_EN      0         /* desactivado por defecto                   */
+#define TH_GAS_MIN     10000.0   /* Ohm  (alerta si BAJA de aqui)             */
+
+/* Histeresis (%): el valor debe alejarse este % del umbral para re-armar la
+   alerta (evita reenvios cuando oscila justo en el borde). */
+#define TH_HYSTERESIS_PCT     10
+
+/* Cooldown minimo entre uplinks de alerta (segundos): respeta el duty-cycle
+   EU868 aunque crucen varios umbrales seguidos. */
+#define ALERT_MIN_INTERVAL_S  60
+
+/* Bits del byte 0 del payload de alerta (FPORT_ALERT). */
+#define ALERT_TEMP  0x01
+#define ALERT_CO    0x02
+#define ALERT_PM25  0x04
+#define ALERT_PM10  0x08
+#define ALERT_VOC   0x10
+#define ALERT_GAS   0x20
 
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
@@ -284,6 +333,29 @@ int main(void)
         uint16_t nox_x10;
     } __packed payload;
 
+    /*
+     * Payload de ALERTA por umbral (FPORT_ALERT, 15 bytes, little-endian).
+     * Autodescriptivo: mascara de que umbrales estan superados + los valores
+     * instantaneos relevantes en el momento de la alerta.
+     *   [0]     uint8  alert_mask: bit0 temp, bit1 CO, bit2 PM2.5, bit3 PM10,
+     *                              bit4 VOC, bit5 gas
+     *   [1-2]   int16  temperatura × 100 (°C)
+     *   [3-4]   uint16 CO          × 10  (ppm)
+     *   [5-6]   uint16 PM2.5       × 10  (µg/m³)
+     *   [7-8]   uint16 PM10        × 10  (µg/m³)
+     *   [9-10]  uint16 VOC index   × 10
+     *   [11-14] uint32 gas resistance    (Ohm)
+     */
+    struct {
+        uint8_t  alert_mask;
+        int16_t  temp_cdeg;
+        uint16_t co_ppm_x10;
+        uint16_t pm2_5_x10;
+        uint16_t pm10_0_x10;
+        uint16_t voc_x10;
+        uint32_t gas_ohm;
+    } __packed alert;
+
     /* Snapshot que se publica al portal en cada ciclo (lectura instantanea). */
     struct portal_sensors ps;
 
@@ -312,14 +384,21 @@ int main(void)
     int64_t last_send_ms = 0;
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
+    /* Estado de las alertas por umbral: 'armed' = que umbrales pueden disparar
+       (flanco de subida); 'pending' = alertas cruzadas aun sin enviar (p.ej.
+       en cooldown o tras un -111). Todos armados al arrancar. */
+    uint8_t alert_armed   = 0xFF;
+    uint8_t alert_pending = 0;
+    int64_t last_alert_ms = 0;
+
     while (1) {
         /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
            en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
         if (portal_take_sos()) {
             static const uint8_t sos_msg[] = { 'S', 'O', 'S' };
-            int sret = lorawan_send(3, (uint8_t *)sos_msg, sizeof(sos_msg),
+            int sret = lorawan_send(FPORT_SOS, (uint8_t *)sos_msg, sizeof(sos_msg),
                                     LORAWAN_MSG_UNCONFIRMED);
-            printk("SOS enviado (FPort 3): %d\n", sret);
+            printk("SOS enviado (FPort %d): %d\n", FPORT_SOS, sret);
         }
 
         ps.bm688_valid = false;
@@ -401,9 +480,77 @@ int main(void)
         /* Portal: siempre actualizado (lo sirve /api/sensors). */
         portal_update_sensors(&ps);
 
+        int64_t now = k_uptime_get();
+
+        /* ---- Alertas por umbral (FPORT_ALERT) --------------------------
+           Compara la lectura INSTANTANEA con los umbrales configurados. Al
+           cruzar (flanco de subida) marca la alerta como pendiente; se re-arma
+           cuando el valor se aleja del umbral (histeresis). El envio respeta
+           un cooldown para no chocar con el duty-cycle. */
+        uint8_t alert_active = 0;
+        uint8_t alert_fired  = 0;
+
+#define TH_CHECK_MAX(en, ok, val, thr, bit) do {                              \
+            if ((en) && (ok)) {                                               \
+                if ((val) >= (thr)) {                                         \
+                    alert_active |= (bit);                                    \
+                    if (alert_armed & (bit)) {                                \
+                        alert_fired |= (bit); alert_armed &= ~(bit);          \
+                    }                                                         \
+                } else if ((val) < (thr) * (1.0 - TH_HYSTERESIS_PCT / 100.0)) { \
+                    alert_armed |= (bit);                                     \
+                }                                                             \
+            }                                                                 \
+        } while (0)
+#define TH_CHECK_MIN(en, ok, val, thr, bit) do {                              \
+            if ((en) && (ok)) {                                               \
+                if ((val) <= (thr)) {                                         \
+                    alert_active |= (bit);                                    \
+                    if (alert_armed & (bit)) {                                \
+                        alert_fired |= (bit); alert_armed &= ~(bit);          \
+                    }                                                         \
+                } else if ((val) > (thr) * (1.0 + TH_HYSTERESIS_PCT / 100.0)) { \
+                    alert_armed |= (bit);                                     \
+                }                                                             \
+            }                                                                 \
+        } while (0)
+
+        TH_CHECK_MAX(TH_TEMP_EN, ps.bm688_valid, ps.temperature,    TH_TEMP_MAX, ALERT_TEMP);
+        TH_CHECK_MAX(TH_CO_EN,   ps.co_valid,     ps.co_ppm,         TH_CO_MAX,   ALERT_CO);
+        TH_CHECK_MAX(TH_PM25_EN, ps.sen65_valid,  ps.pm2_5,          TH_PM25_MAX, ALERT_PM25);
+        TH_CHECK_MAX(TH_PM10_EN, ps.sen65_valid,  ps.pm10_0,         TH_PM10_MAX, ALERT_PM10);
+        TH_CHECK_MAX(TH_VOC_EN,  ps.sen65_valid,  ps.voc_index,      TH_VOC_MAX,  ALERT_VOC);
+        TH_CHECK_MIN(TH_GAS_EN,  ps.bm688_valid,  ps.gas_resistance, TH_GAS_MIN,  ALERT_GAS);
+
+#undef TH_CHECK_MAX
+#undef TH_CHECK_MIN
+
+        alert_pending |= alert_fired;
+
+        if (alert_pending != 0 &&
+            (last_alert_ms == 0 ||
+             (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000)) {
+            alert.alert_mask = alert_active;
+            alert.temp_cdeg  = (int16_t)(ps.temperature * 100.0);
+            alert.co_ppm_x10 = (uint16_t)(ps.co_ppm * 10.0);
+            alert.pm2_5_x10  = (uint16_t)(ps.pm2_5 * 10.0);
+            alert.pm10_0_x10 = (uint16_t)(ps.pm10_0 * 10.0);
+            alert.voc_x10    = (uint16_t)(ps.voc_index * 10.0);
+            alert.gas_ohm    = (uint32_t)ps.gas_resistance;
+
+            int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,
+                                    sizeof(alert), LORAWAN_MSG_UNCONFIRMED);
+            printk("ALERTA umbral mask=0x%02x -> FPort %d: %d\n",
+                   alert_active, FPORT_ALERT, aret);
+            if (aret == 0) {
+                alert_pending = 0;      /* enviada: limpia lo pendiente */
+                last_alert_ms = now;
+            }
+            /* si falla (p.ej. -111 duty-cycle) queda pendiente y reintenta luego */
+        }
+
         /* LoRa: solo en su cadencia, respetando el duty-cycle. Se arma el
            payload con el PROMEDIO de la ventana y se resetea el acumulador. */
-        int64_t now = k_uptime_get();
         if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_SEND_PERIOD_S * 1000) {
             memset(&payload, 0, sizeof(payload));
 
@@ -436,7 +583,7 @@ int main(void)
             printk("SEND avg (bm=%u co=%u sen=%u muestras)\n",
                    acc.bm_n, acc.co_n, acc.sen_n);
 
-            ret = lorawan_send(2, (uint8_t *)&payload, sizeof(payload),
+            ret = lorawan_send(FPORT_DATA, (uint8_t *)&payload, sizeof(payload),
                                LORAWAN_MSG_UNCONFIRMED);
             if (ret < 0) {
                 /* -111 (duty-cycle) es normal/regulatorio en EU868, no fatal. */

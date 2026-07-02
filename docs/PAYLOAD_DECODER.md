@@ -8,9 +8,18 @@ arranque (EUI-64 estándar insertando `FF FE`). Se imprime en el log de boot com
 `DevEUI(MAC)=...`; para esta placa es **`1CDBD4FFFEBD2444`**. JoinEUI:
 `0000000000000000` · AppKey: `062635ACC3BBC92C2FEF994F5EF0F69B`.
 
-**FPort 2** = datos de sensores (este doc). **FPort 3** = botón de EMERGENCIA:
-payload ASCII `"SOS"` (3 B); el decoder lo devuelve como
-`{"alert":"SOS","source":"panic_button"}`.
+**Mapa de FPorts (canales lógicos)** — cada tipo de mensaje va por su propio
+FPort para poder enrutarlo/actuar por separado en ChirpStack:
+
+| FPort | Sentido | Contenido |
+|---|---|---|
+| **2** | uplink | **Datos** periódicos (promedio de la ventana), 29 B. Este doc §2. |
+| **3** | uplink | **SOS** del botón del portal: ASCII `"SOS"` (3 B) → `{"alert":"SOS","source":"panic_button"}`. |
+| **4** | uplink | **Alerta por umbral** (threshold), 15 B. Ver §2.1. |
+| **10** | downlink | Actualización OTA del HTML del portal (BEGIN/DATA/COMMIT). |
+
+Los FPorts de envío se definen en el bloque *CANALES (FPorts)* al principio de
+`src/main.c` (`FPORT_DATA`, `FPORT_SOS`, `FPORT_ALERT`).
 
 ---
 
@@ -76,6 +85,36 @@ payload ASCII `"SOS"` (3 B); el decoder lo devuelve como
 
 Los campos de un sensor ausente van a **0**; usar **flags** (byte 0) para saber
 qué es válido. No hay CRC de aplicación: LoRaWAN ya protege la trama (MIC).
+
+### 2.1 Payload de ALERTA por umbral (FPort 4, 15 bytes, little-endian)
+
+Se envía **automáticamente** cuando una lectura instantánea **cruza** un umbral
+configurado (flanco de subida). No se reenvía hasta que el valor baje del umbral
+(con histéresis) y lo vuelva a cruzar. Es autodescriptivo (máscara + valores):
+
+| Offset | Tipo | Campo | Escala → unidad |
+|---|---|---|---|
+| 0 | uint8 | **alert_mask** | bit0 temp · bit1 CO · bit2 PM2.5 · bit3 PM10 · bit4 VOC · bit5 gas |
+| 1–2 | int16 | temperatura | ÷100 → °C |
+| 3–4 | uint16 | CO | ÷10 → ppm |
+| 5–6 | uint16 | PM2.5 | ÷10 → µg/m³ |
+| 7–8 | uint16 | PM10 | ÷10 → µg/m³ |
+| 9–10 | uint16 | VOC index | ÷10 |
+| 11–14 | uint32 | gas resistance | → Ω |
+
+Salida del decoder (FPort 4):
+```json
+{ "alert": "THRESHOLD",
+  "triggered": { "temperature": true, "co": false, "pm2_5": true, "pm10": false, "voc": false, "gas": false },
+  "values": { "temperature_c": 55.0, "co_ppm": 0.5, "pm2p5_ugm3": 60.0, "pm10_ugm3": 20.0, "voc_index": 100.0, "gas_resistance_ohm": 45000 } }
+```
+
+**Dónde se definen los umbrales:** bloque *UMBRALES DE ALERTA* al principio de
+`src/main.c`. Cada uno tiene un `_EN` (1/0 para activar/desactivar) y su valor
+(p.ej. `TH_CO_MAX 35.0`, `TH_PM25_MAX 55.0`, `TH_TEMP_MAX 50.0`). El gas del
+BM688 es de tipo "mínimo" (alerta si CAE por debajo de `TH_GAS_MIN`). Ajustables:
+`TH_HYSTERESIS_PCT` (histéresis de re-armado) y `ALERT_MIN_INTERVAL_S` (cooldown
+mínimo entre alertas, para no chocar con el duty-cycle).
 
 ### Cómo se conforma (en `src/main.c`)
 Un `struct __packed` con esos campos en ese orden exacto. Cada campo es el
