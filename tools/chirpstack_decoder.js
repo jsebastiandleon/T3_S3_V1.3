@@ -25,15 +25,19 @@ function decodeUplink(input) {
       return { errors: ["alerta demasiado corta: " + b.length + " (esperado 15)"] };
     }
     var m = b[0];
+    var fire = (m & 0x80) !== 0;
     return { data: {
-      alert: "THRESHOLD",
+      alert: fire ? "FIRE" : "THRESHOLD",   // FUEGO confirmado (multicriterio) vs umbral simple
+      fire_confirmed: fire,                 // EN 54-30/31: coincidencia de >=2 familias
       triggered: {
         temperature: (m & 0x01) !== 0,
         co:          (m & 0x02) !== 0,
         pm2_5:       (m & 0x04) !== 0,
         pm10:        (m & 0x08) !== 0,
         voc:         (m & 0x10) !== 0,
-        gas:         (m & 0x20) !== 0
+        gas:         (m & 0x20) !== 0,
+        heat_rate:   (m & 0x40) !== 0,      // EN 54-5 rate-of-rise (subida rapida)
+        fire:        fire
       },
       values: {
         temperature_c:      s16(1) / 100,

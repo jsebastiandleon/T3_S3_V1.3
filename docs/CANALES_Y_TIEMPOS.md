@@ -114,14 +114,26 @@ Independientes del ciclo de envío: se evalúan en cada lectura (5 s) contra la
 medida instantánea, así reaccionan rápido.
 
 ```c
-// Valores orientados a DETECCION TEMPRANA DE INCENDIO (base en estandares)
-#define TH_TEMP_EN  1 ; #define TH_TEMP_MAX  60.0   // °C   (EN 54-5 termico A1 54-65)
+// Valores orientados a DETECCION DE INCENDIO (base en estandares)
+#define TH_TEMP_EN  1 ; #define TH_TEMP_MAX  58.0   // °C   (EN 54-5 termico A1 54-65)
 #define TH_CO_EN    1 ; #define TH_CO_MAX    10.0   // ppm  (EPA AQI CO "USG" ~9-12; fondo <1)
 #define TH_PM25_EN  1 ; #define TH_PM25_MAX  35.0   // µg/m³(EPA AQI PM2.5 "USG"; humo)
 #define TH_PM10_EN  1 ; #define TH_PM10_MAX  150.0  // µg/m³(~EPA AQI PM10 "USG" 155)
 #define TH_VOC_EN   1 ; #define TH_VOC_MAX   150.0  // índice (base ~100; humo real ~175)
 #define TH_GAS_EN   0 ; #define TH_GAS_MIN   10000.0// Ω  (MOX sin calibrar -> desactivado)
 ```
+
+**Normas de incendio implementadas** (además de los umbrales fijos):
+
+- **EN 54-5 · rate-of-rise térmico** — dispara si la temperatura **sube rápido**
+  (`TH_ROR_CPMIN`, def. 8 °C/min, sobre ventana deslizante `TH_ROR_WINDOW_S`),
+  aunque no llegue al umbral fijo. Es el bit **0x40** del mask (un fuego cercano
+  calienta el aire deprisa antes de alcanzar 58 °C).
+- **EN 54-30/31 · confirmación multicriterio** — declara **FUEGO** (bit **0x80**)
+  solo si coinciden **≥ `FIRE_MIN_CRITERIA`** (def. 2) **familias**: humo
+  (PM2.5/PM10), CO y calor (temp fija o rate-of-rise). Reduce falsas alarmas
+  (polvo = solo PM, cocina = solo CO, sol = solo calor). El uplink de FUEGO
+  **salta el cooldown** y sale de inmediato; el decoder lo marca `alert:"FIRE"`.
 
 Reglas anti-spam:
 

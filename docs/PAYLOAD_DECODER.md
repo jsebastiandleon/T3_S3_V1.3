@@ -94,7 +94,7 @@ configurado (flanco de subida). No se reenvía hasta que el valor baje del umbra
 
 | Offset | Tipo | Campo | Escala → unidad |
 |---|---|---|---|
-| 0 | uint8 | **alert_mask** | bit0 temp · bit1 CO · bit2 PM2.5 · bit3 PM10 · bit4 VOC · bit5 gas |
+| 0 | uint8 | **alert_mask** | bit0 temp · bit1 CO · bit2 PM2.5 · bit3 PM10 · bit4 VOC · bit5 gas · **bit6 rate-of-rise térmico (EN 54-5)** · **bit7 FUEGO confirmado (EN 54-30/31)** |
 | 1–2 | int16 | temperatura | ÷100 → °C |
 | 3–4 | uint16 | CO | ÷10 → ppm |
 | 5–6 | uint16 | PM2.5 | ÷10 → µg/m³ |
@@ -102,22 +102,40 @@ configurado (flanco de subida). No se reenvía hasta que el valor baje del umbra
 | 9–10 | uint16 | VOC index | ÷10 |
 | 11–14 | uint32 | gas resistance | → Ω |
 
-Salida del decoder (FPort 4):
+El mask reporta lo que **cruzó** durante la ventana (nunca 0), y los valores son
+los del **instante del disparo**. **bit7 = FUEGO** se activa por coincidencia
+multicriterio (ver abajo) y ese uplink se envía **de inmediato** (salta el
+cooldown). El decoder pone `alert:"FIRE"` y `fire_confirmed:true` cuando bit7=1.
+
+Salida del decoder (FPort 4) — ejemplo de FUEGO confirmado (humo + CO):
 ```json
-{ "alert": "THRESHOLD",
-  "triggered": { "temperature": true, "co": false, "pm2_5": true, "pm10": false, "voc": false, "gas": false },
-  "values": { "temperature_c": 55.0, "co_ppm": 0.5, "pm2p5_ugm3": 60.0, "pm10_ugm3": 20.0, "voc_index": 100.0, "gas_resistance_ohm": 45000 } }
+{ "alert": "FIRE", "fire_confirmed": true,
+  "triggered": { "temperature": false, "co": true, "pm2_5": true, "pm10": true,
+                 "voc": false, "gas": false, "heat_rate": false, "fire": true },
+  "values": { "temperature_c": 33.0, "co_ppm": 50.0, "pm2p5_ugm3": 2918.0,
+              "pm10_ugm3": 873.5, "voc_index": 9.0, "gas_resistance_ohm": 20700 } }
 ```
 
 **Dónde se definen los umbrales:** bloque *UMBRALES DE ALERTA* al principio de
 `src/main.c`. Cada uno tiene un `_EN` (1/0 para activar/desactivar) y su valor.
-Valores orientados a **detección temprana de incendio** (base en estándares):
+Valores orientados a **detección de incendio** (base en estándares):
 `TH_CO_MAX 10.0` ppm (EPA AQI CO "USG"), `TH_PM25_MAX 35.0` µg/m³ (EPA AQI PM2.5
-"USG"; principal marcador de humo), `TH_PM10_MAX 150.0` µg/m³, `TH_TEMP_MAX 60.0`
-°C (EN 54-5 térmico A1), `TH_VOC_MAX 150.0` (índice Sensirion, base ~100). El gas
-del BM688 es de tipo "mínimo" (alerta si CAE por debajo de `TH_GAS_MIN`) y viene
-**desactivado** (MOX sin calibrar). Ajustables: `TH_HYSTERESIS_PCT` (histéresis de
-re-armado) y `ALERT_MIN_INTERVAL_S` (cooldown mínimo entre alertas).
+"USG"; principal marcador de humo), `TH_PM10_MAX 150.0` µg/m³, `TH_TEMP_MAX 58.0`
+°C (**EN 54-5**, banda de respuesta clase A1 54–65 °C), `TH_VOC_MAX 150.0` (índice
+Sensirion, base ~100). El gas del BM688 es de tipo "mínimo" (alerta si CAE por
+debajo de `TH_GAS_MIN`) y viene **desactivado** (MOX sin calibrar). Ajustables:
+`TH_HYSTERESIS_PCT` (histéresis de re-armado) y `ALERT_MIN_INTERVAL_S` (cooldown).
+
+**Normas de incendio implementadas:**
+- **EN 54-5 · rate-of-rise térmico** (`TH_ROR_CPMIN`, def. 8 °C/min sobre ventana
+  `TH_ROR_WINDOW_S`): dispara **bit6** si la temperatura sube rápido, aunque no
+  llegue al umbral fijo — detecta un fuego cercano antes que el umbral absoluto.
+- **EN 54-30/31 · confirmación multicriterio** (`FIRE_MIN_CRITERIA`, def. 2):
+  declara **FUEGO** (bit7) solo si coinciden ≥2 **familias** de indicio —
+  **humo** (PM2.5/PM10), **CO** y **calor** (temp fija o rate-of-rise). Evita
+  falsas alarmas (polvo = solo PM, cocina = solo CO, calor solar = solo temp);
+  un incendio real activa varias a la vez. El uplink de FUEGO **ignora el
+  cooldown** y sale de inmediato.
 
 ### Cómo se conforma (en `src/main.c`)
 Un `struct __packed` con esos campos en ese orden exacto. Cada campo es el

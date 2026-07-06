@@ -123,14 +123,15 @@ static void i2c1_scan(void)
  *            OCUPACIONALES (demasiado altos para deteccion temprana).
  *   - PM2.5: EPA AQI -> "USG" desde 35 ug/m3; marcador PRINCIPAL del humo.
  *   - PM10:  EPA AQI -> "USG" ~155 ug/m3 (dejamos 150 como corroboracion).
- *   - Temp:  EN 54-5 (detectores termicos): alarma clase A1 entre 54-65 C;
- *            60 C queda por encima de olas de calor + autocalentamiento de caja.
+ *   - Temp:  EN 54-5 (detectores termicos): alarma clase A1 (respuesta
+ *            estatica entre 54-65 C). 58 C = punto medio de esa banda, por
+ *            encima de olas de calor + autocalentamiento de la caja.
  *   - VOC:   indice Sensirion (base ~100); la combustion lo dispara >>100.
  *   - Gas (BM688): MOX sin calibrar y con deriva -> umbral fijo poco fiable;
  *            se deja DESACTIVADO (primarios: PM2.5, CO, VOC).
  */
 #define TH_TEMP_EN     1
-#define TH_TEMP_MAX    60.0      /* grados C  (EN 54-5 termico clase A1 54-65) */
+#define TH_TEMP_MAX    58.0      /* grados C  (EN 54-5 termico clase A1 54-65) */
 #define TH_CO_EN       1
 #define TH_CO_MAX      10.0      /* ppm  (EPA AQI CO "USG" ~9-12; fondo <1)    */
 #define TH_PM25_EN     1
@@ -147,16 +148,42 @@ static void i2c1_scan(void)
 #define TH_HYSTERESIS_PCT     10
 
 /* Cooldown minimo entre uplinks de alerta (segundos): respeta el duty-cycle
-   EU868 aunque crucen varios umbrales seguidos. */
+   EU868 aunque crucen varios umbrales seguidos. Un FUEGO confirmado
+   (multicriterio) IGNORA este cooldown y sale de inmediato. */
 #define ALERT_MIN_INTERVAL_S  60
 
+/* =======================================================================
+ *  NORMA EN 54-5 — RATE-OF-RISE TERMICO
+ * =======================================================================
+ * Ademas del umbral fijo (TH_TEMP_MAX), se detecta una SUBIDA RAPIDA de
+ * temperatura: un incendio cercano calienta el aire deprisa mucho antes de
+ * llegar a 58 C. Se mide sobre una ventana deslizante y se alarma si el ritmo
+ * supera TH_ROR_CPMIN (grados C por minuto). Valor tipico de detectores
+ * rate-of-rise EN 54-5: ~8 C/min. */
+#define TH_ROR_EN        1
+#define TH_ROR_CPMIN     8.0     /* grados C por minuto */
+#define TH_ROR_WINDOW_S  60      /* ventana deslizante para medir el ritmo */
+
+/* =======================================================================
+ *  NORMA EN 54-30/31 — CONFIRMACION MULTICRITERIO DE FUEGO
+ * =======================================================================
+ * Los detectores multisensor declaran FUEGO por COINCIDENCIA de varias
+ * familias de indicio, no por una sola -> muchas menos falsas alarmas
+ * (polvo=solo PM, cocina=solo CO, sauna=solo calor; INCENDIO = varios a la
+ * vez). Aqui las familias son: HUMO (PM2.5/PM10), CO y CALOR (temp fija o
+ * rate-of-rise). Si coinciden >= FIRE_MIN_CRITERIA, se declara FUEGO y el
+ * uplink de alerta se envia de inmediato (salta el cooldown). */
+#define FIRE_MIN_CRITERIA  2
+
 /* Bits del byte 0 del payload de alerta (FPORT_ALERT). */
-#define ALERT_TEMP  0x01
-#define ALERT_CO    0x02
-#define ALERT_PM25  0x04
-#define ALERT_PM10  0x08
-#define ALERT_VOC   0x10
-#define ALERT_GAS   0x20
+#define ALERT_TEMP     0x01
+#define ALERT_CO       0x02
+#define ALERT_PM25     0x04
+#define ALERT_PM10     0x08
+#define ALERT_VOC      0x10
+#define ALERT_GAS      0x20
+#define ALERT_HEAT_ROR 0x40   /* subida rapida de temperatura (EN 54-5)        */
+#define ALERT_FIRE     0x80   /* FUEGO confirmado multicriterio (EN 54-30/31)  */
 
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
@@ -404,6 +431,14 @@ int main(void)
     uint8_t alert_pending = 0;
     int64_t last_alert_ms = 0;
 
+    /* Ventana deslizante de temperatura para el rate-of-rise EN 54-5:
+       guarda (tiempo, temperatura) de las ultimas ~TH_ROR_WINDOW_S y calcula
+       el ritmo (C/min) entre la muestra mas antigua y la mas reciente. */
+#define ROR_N ((TH_ROR_WINDOW_S / SENSOR_READ_PERIOD_S) + 1)
+    int64_t ror_ms[ROR_N];
+    double  ror_temp[ROR_N];
+    int     ror_count = 0;
+
     while (1) {
         /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
            en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
@@ -495,11 +530,36 @@ int main(void)
 
         int64_t now = k_uptime_get();
 
+        /* Rate-of-rise termico (EN 54-5): mete (now, temp) en la ventana
+           deslizante y calcula el ritmo en C/min entre la muestra mas antigua
+           y la actual. Solo con dato fresco del BM688. */
+        double temp_ror_cpmin = 0.0;
+        bool   ror_ready = false;
+        if (ps.bm688_valid) {
+            if (ror_count < ROR_N) {
+                ror_ms[ror_count]   = now;
+                ror_temp[ror_count] = ps.temperature;
+                ror_count++;
+            } else {
+                memmove(ror_ms,   ror_ms + 1,   (ROR_N - 1) * sizeof(ror_ms[0]));
+                memmove(ror_temp, ror_temp + 1, (ROR_N - 1) * sizeof(ror_temp[0]));
+                ror_ms[ROR_N - 1]   = now;
+                ror_temp[ROR_N - 1] = ps.temperature;
+            }
+            if (ror_count >= ROR_N) {
+                double dt_min = (double)(ror_ms[ROR_N - 1] - ror_ms[0]) / 60000.0;
+                if (dt_min > 0.0) {
+                    temp_ror_cpmin = (ror_temp[ROR_N - 1] - ror_temp[0]) / dt_min;
+                    ror_ready = true;
+                }
+            }
+        }
+
         /* ---- Alertas por umbral (FPORT_ALERT) --------------------------
            Compara la lectura INSTANTANEA con los umbrales configurados. Al
            cruzar (flanco de subida) marca la alerta como pendiente; se re-arma
            cuando el valor se aleja del umbral (histeresis). El envio respeta
-           un cooldown para no chocar con el duty-cycle. */
+           un cooldown para no chocar con el duty-cycle (salvo FUEGO). */
         uint8_t alert_active = 0;
         uint8_t alert_fired  = 0;
 
@@ -527,6 +587,18 @@ int main(void)
                 }                                                             \
             }                                                                 \
         } while (0)
+#define TH_CHECK_BOOL(en, cond, bit) do {                                     \
+            if (en) {                                                         \
+                if (cond) {                                                   \
+                    alert_active |= (bit);                                    \
+                    if (alert_armed & (bit)) {                                \
+                        alert_fired |= (bit); alert_armed &= ~(bit);          \
+                    }                                                         \
+                } else {                                                      \
+                    alert_armed |= (bit);                                     \
+                }                                                             \
+            }                                                                 \
+        } while (0)
 
         TH_CHECK_MAX(TH_TEMP_EN, ps.bm688_valid, ps.temperature,    TH_TEMP_MAX, ALERT_TEMP);
         TH_CHECK_MAX(TH_CO_EN,   ps.co_valid,     ps.co_ppm,         TH_CO_MAX,   ALERT_CO);
@@ -535,8 +607,24 @@ int main(void)
         TH_CHECK_MAX(TH_VOC_EN,  ps.sen65_valid,  ps.voc_index,      TH_VOC_MAX,  ALERT_VOC);
         TH_CHECK_MIN(TH_GAS_EN,  ps.bm688_valid,  ps.gas_resistance, TH_GAS_MIN,  ALERT_GAS);
 
+        /* EN 54-5 rate-of-rise: subida rapida de temperatura (aunque no llegue
+           al umbral fijo). */
+        TH_CHECK_BOOL(TH_ROR_EN && ror_ready, temp_ror_cpmin >= TH_ROR_CPMIN,
+                      ALERT_HEAT_ROR);
+
+        /* EN 54-30/31 multicriterio: FUEGO si coinciden >= FIRE_MIN_CRITERIA
+           familias de indicio (HUMO / CO / CALOR), sobre el estado activo. */
+        {
+            int fam_smoke = (alert_active & (ALERT_PM25 | ALERT_PM10))    ? 1 : 0;
+            int fam_co    = (alert_active &  ALERT_CO)                    ? 1 : 0;
+            int fam_heat  = (alert_active & (ALERT_TEMP | ALERT_HEAT_ROR))? 1 : 0;
+            int criteria  = fam_smoke + fam_co + fam_heat;
+            TH_CHECK_BOOL(1, criteria >= FIRE_MIN_CRITERIA, ALERT_FIRE);
+        }
+
 #undef TH_CHECK_MAX
 #undef TH_CHECK_MIN
+#undef TH_CHECK_BOOL
 
         alert_pending |= alert_fired;
 
@@ -554,8 +642,12 @@ int main(void)
             alert.gas_ohm    = (uint32_t)ps.gas_resistance;
         }
 
+        /* Un FUEGO recien confirmado (EN 54-30/31) es critico -> se envia YA,
+           ignorando el cooldown. El resto de alertas respetan el cooldown. */
+        bool fire_now = (alert_fired & ALERT_FIRE) != 0;
+
         if (alert_pending != 0 &&
-            (last_alert_ms == 0 ||
+            (fire_now || last_alert_ms == 0 ||
              (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000)) {
             /* El mask reporta que umbrales CRUZARON en la ventana (pending),
                nunca 0; alert_active es solo informativo (que sigue alto ahora). */
@@ -563,7 +655,8 @@ int main(void)
 
             int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,
                                     sizeof(alert), LORAWAN_MSG_UNCONFIRMED);
-            printk("ALERTA umbral disparo=0x%02x activo_ahora=0x%02x -> FPort %d: %d\n",
+            printk("ALERTA%s disparo=0x%02x activo_ahora=0x%02x -> FPort %d: %d\n",
+                   (alert_pending & ALERT_FIRE) ? " [FUEGO]" : "",
                    alert_pending, alert_active, FPORT_ALERT, aret);
             if (aret == 0) {
                 alert_pending = 0;      /* enviada: limpia lo pendiente */
