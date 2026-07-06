@@ -114,12 +114,13 @@ Independientes del ciclo de envío: se evalúan en cada lectura (5 s) contra la
 medida instantánea, así reaccionan rápido.
 
 ```c
-#define TH_TEMP_EN  1 ; #define TH_TEMP_MAX  50.0   // °C
-#define TH_CO_EN    1 ; #define TH_CO_MAX    35.0   // ppm
-#define TH_PM25_EN  1 ; #define TH_PM25_MAX  55.0   // µg/m³
-#define TH_PM10_EN  1 ; #define TH_PM10_MAX  150.0  // µg/m³
-#define TH_VOC_EN   1 ; #define TH_VOC_MAX   250.0  // índice
-#define TH_GAS_EN   0 ; #define TH_GAS_MIN   10000.0// Ω (alerta si BAJA)
+// Valores orientados a DETECCION TEMPRANA DE INCENDIO (base en estandares)
+#define TH_TEMP_EN  1 ; #define TH_TEMP_MAX  60.0   // °C   (EN 54-5 termico A1 54-65)
+#define TH_CO_EN    1 ; #define TH_CO_MAX    10.0   // ppm  (EPA AQI CO "USG" ~9-12; fondo <1)
+#define TH_PM25_EN  1 ; #define TH_PM25_MAX  35.0   // µg/m³(EPA AQI PM2.5 "USG"; humo)
+#define TH_PM10_EN  1 ; #define TH_PM10_MAX  150.0  // µg/m³(~EPA AQI PM10 "USG" 155)
+#define TH_VOC_EN   1 ; #define TH_VOC_MAX   150.0  // índice (base ~100; humo real ~175)
+#define TH_GAS_EN   0 ; #define TH_GAS_MIN   10000.0// Ω  (MOX sin calibrar -> desactivado)
 ```
 
 Reglas anti-spam:

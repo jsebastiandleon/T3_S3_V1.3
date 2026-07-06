@@ -115,19 +115,32 @@ static void i2c1_scan(void)
  * Para DESACTIVAR un umbral, pon su *_EN a 0.
  * Casi todos son "maximo" (alerta si SUPERA el valor). El gas del BM688 es
  * al reves: alerta si CAE por DEBAJO del valor (menos ohmios = aire peor).
+ *
+ * Valores orientados a DETECCION TEMPRANA DE INCENDIO (humo/combustion),
+ * apoyados en estandares. Referencias:
+ *   - CO:    EPA AQI de CO -> "insalubre p/sensibles" arranca ~9-12 ppm;
+ *            fondo exterior <1 ppm. NIOSH 8h=35 / OSHA 8h=50 ppm son limites
+ *            OCUPACIONALES (demasiado altos para deteccion temprana).
+ *   - PM2.5: EPA AQI -> "USG" desde 35 ug/m3; marcador PRINCIPAL del humo.
+ *   - PM10:  EPA AQI -> "USG" ~155 ug/m3 (dejamos 150 como corroboracion).
+ *   - Temp:  EN 54-5 (detectores termicos): alarma clase A1 entre 54-65 C;
+ *            60 C queda por encima de olas de calor + autocalentamiento de caja.
+ *   - VOC:   indice Sensirion (base ~100); la combustion lo dispara >>100.
+ *   - Gas (BM688): MOX sin calibrar y con deriva -> umbral fijo poco fiable;
+ *            se deja DESACTIVADO (primarios: PM2.5, CO, VOC).
  */
 #define TH_TEMP_EN     1
-#define TH_TEMP_MAX    50.0      /* grados C                                  */
+#define TH_TEMP_MAX    60.0      /* grados C  (EN 54-5 termico clase A1 54-65) */
 #define TH_CO_EN       1
-#define TH_CO_MAX      35.0      /* ppm  (35 ppm = limite de exposicion 8h)   */
+#define TH_CO_MAX      10.0      /* ppm  (EPA AQI CO "USG" ~9-12; fondo <1)    */
 #define TH_PM25_EN     1
-#define TH_PM25_MAX    55.0      /* ug/m3  (calidad de aire "insalubre")      */
+#define TH_PM25_MAX    35.0      /* ug/m3  (EPA AQI PM2.5 "USG"; humo)         */
 #define TH_PM10_EN     1
-#define TH_PM10_MAX    150.0     /* ug/m3                                     */
+#define TH_PM10_MAX    150.0     /* ug/m3  (~EPA AQI PM10 "USG" 155)           */
 #define TH_VOC_EN      1
-#define TH_VOC_MAX     250.0     /* indice VOC (nominal ~100)                 */
-#define TH_GAS_EN      0         /* desactivado por defecto                   */
-#define TH_GAS_MIN     10000.0   /* Ohm  (alerta si BAJA de aqui)             */
+#define TH_VOC_MAX     150.0     /* indice VOC (base ~100; humo real ~175)     */
+#define TH_GAS_EN      0         /* MOX sin calibrar/deriva -> desactivado     */
+#define TH_GAS_MIN     10000.0   /* Ohm  (si se activa: alerta si BAJA)        */
 
 /* Histeresis (%): el valor debe alejarse este % del umbral para re-armar la
    alerta (evita reenvios cuando oscila justo en el borde). */
@@ -527,21 +540,31 @@ int main(void)
 
         alert_pending |= alert_fired;
 
-        if (alert_pending != 0 &&
-            (last_alert_ms == 0 ||
-             (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000)) {
-            alert.alert_mask = alert_active;
+        /* Al DISPARAR (flanco) se capturan los valores de ESE instante en el
+           payload de alerta. Asi el mask y los valores del uplink corresponden
+           al evento que cruzo, aunque el envio se retrase por el cooldown y la
+           medida ya haya bajado (evita mandar una alerta con valores ya
+           recuperados). */
+        if (alert_fired != 0) {
             alert.temp_cdeg  = (int16_t)(ps.temperature * 100.0);
             alert.co_ppm_x10 = (uint16_t)(ps.co_ppm * 10.0);
             alert.pm2_5_x10  = (uint16_t)(ps.pm2_5 * 10.0);
             alert.pm10_0_x10 = (uint16_t)(ps.pm10_0 * 10.0);
             alert.voc_x10    = (uint16_t)(ps.voc_index * 10.0);
             alert.gas_ohm    = (uint32_t)ps.gas_resistance;
+        }
+
+        if (alert_pending != 0 &&
+            (last_alert_ms == 0 ||
+             (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000)) {
+            /* El mask reporta que umbrales CRUZARON en la ventana (pending),
+               nunca 0; alert_active es solo informativo (que sigue alto ahora). */
+            alert.alert_mask = alert_pending;
 
             int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,
                                     sizeof(alert), LORAWAN_MSG_UNCONFIRMED);
-            printk("ALERTA umbral mask=0x%02x -> FPort %d: %d\n",
-                   alert_active, FPORT_ALERT, aret);
+            printk("ALERTA umbral disparo=0x%02x activo_ahora=0x%02x -> FPort %d: %d\n",
+                   alert_pending, alert_active, FPORT_ALERT, aret);
             if (aret == 0) {
                 alert_pending = 0;      /* enviada: limpia lo pendiente */
                 last_alert_ms = now;

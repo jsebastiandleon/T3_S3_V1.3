@@ -110,11 +110,14 @@ Salida del decoder (FPort 4):
 ```
 
 **Dónde se definen los umbrales:** bloque *UMBRALES DE ALERTA* al principio de
-`src/main.c`. Cada uno tiene un `_EN` (1/0 para activar/desactivar) y su valor
-(p.ej. `TH_CO_MAX 35.0`, `TH_PM25_MAX 55.0`, `TH_TEMP_MAX 50.0`). El gas del
-BM688 es de tipo "mínimo" (alerta si CAE por debajo de `TH_GAS_MIN`). Ajustables:
-`TH_HYSTERESIS_PCT` (histéresis de re-armado) y `ALERT_MIN_INTERVAL_S` (cooldown
-mínimo entre alertas, para no chocar con el duty-cycle).
+`src/main.c`. Cada uno tiene un `_EN` (1/0 para activar/desactivar) y su valor.
+Valores orientados a **detección temprana de incendio** (base en estándares):
+`TH_CO_MAX 10.0` ppm (EPA AQI CO "USG"), `TH_PM25_MAX 35.0` µg/m³ (EPA AQI PM2.5
+"USG"; principal marcador de humo), `TH_PM10_MAX 150.0` µg/m³, `TH_TEMP_MAX 60.0`
+°C (EN 54-5 térmico A1), `TH_VOC_MAX 150.0` (índice Sensirion, base ~100). El gas
+del BM688 es de tipo "mínimo" (alerta si CAE por debajo de `TH_GAS_MIN`) y viene
+**desactivado** (MOX sin calibrar). Ajustables: `TH_HYSTERESIS_PCT` (histéresis de
+re-armado) y `ALERT_MIN_INTERVAL_S` (cooldown mínimo entre alertas).
 
 ### Cómo se conforma (en `src/main.c`)
 Un `struct __packed` con esos campos en ese orden exacto. Cada campo es el
