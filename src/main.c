@@ -93,8 +93,23 @@ static void i2c1_scan(void)
  *   lectura, sino el PROMEDIO de todas las lecturas tomadas dentro de la
  *   ventana de envio (LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S muestras).
  * ======================================================================= */
-#define LORA_SEND_PERIOD_S    729
+#define LORA_SEND_PERIOD_S    180
 #define SENSOR_READ_PERIOD_S  5
+
+/* =======================================================================
+ *  SUPERVISION DEL ENLACE  (keepalive confirmado + auto-rejoin)
+ * =======================================================================
+ * Un uplink UNCONFIRMED no da NINGUNA pista de si llego: el nodo puede
+ * transmitir horas al vacio y decir "SEND OK" siempre. Para detectar un
+ * enlace muerto y recuperarlo solo:
+ *   - LINK_KEEPALIVE_EVERY: 1 de cada N envios de datos va CONFIRMED, para
+ *     forzar un ACK del servidor (prueba de vida real del enlace).
+ *   - LINK_MAX_FAILS: si ese numero de keepalives seguidos NO reciben ACK,
+ *     se asume enlace caido y se hace REJOIN (vuelve a SF12, sesion nueva).
+ * Con N=6 y periodo 180 s, se sondea ~cada 18 min; 3 fallos ~= 54 min de
+ * silencio antes de re-unirse (robusto ante un -111 puntual de duty-cycle). */
+#define LINK_KEEPALIVE_EVERY  6
+#define LINK_MAX_FAILS        3
 
 /* =======================================================================
  *  CANALES (FPorts) — cada tipo de mensaje va por su PROPIO FPort, para
@@ -424,6 +439,11 @@ int main(void)
     int64_t last_send_ms = 0;
     int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
 
+    /* Supervision del enlace: cuenta de envios de datos (para el keepalive) y
+       de keepalives consecutivos sin ACK (para disparar el rejoin). */
+    uint32_t data_send_count = 0;
+    int      link_fails = 0;
+
     /* Estado de las alertas por umbral: 'armed' = que umbrales pueden disparar
        (flanco de subida); 'pending' = alertas cruzadas aun sin enviar (p.ej.
        en cooldown o tras un -111). Todos armados al arrancar. */
@@ -646,28 +666,27 @@ int main(void)
            ignorando el cooldown. El resto de alertas respetan el cooldown. */
         bool fire_now = (alert_fired & ALERT_FIRE) != 0;
 
-        if (alert_pending != 0 &&
-            (fire_now || last_alert_ms == 0 ||
-             (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000)) {
-            /* El mask reporta que umbrales CRUZARON en la ventana (pending),
-               nunca 0; alert_active es solo informativo (que sigue alto ahora). */
-            alert.alert_mask = alert_pending;
+        /* =============================================================
+         *  PRIORIDAD DE RADIO: FPort 2 (datos) SIEMPRE PRIMERO
+         * =============================================================
+         * Todo comparte la MISMA radio y el MISMO presupuesto de
+         * duty-cycle EU868 (1%). Los tres canales (SOS/alerta/datos) son
+         * envios BLOQUEANTES y secuenciales en este unico hilo. Si una
+         * alerta (FPort 4) consume el airtime justo antes de un envio de
+         * datos programado, el FPort 2 se rechazaria por duty-cycle
+         * (-EAGAIN/"-111") y se perderia ese periodo entero.
+         *
+         * Regla: si toca enviar datos en este ciclo, el FPort 2 reclama
+         * el airtime PRIMERO; la alerta se aplaza (queda en alert_pending
+         * y sale en un ciclo posterior). Unica excepcion: un FUEGO
+         * confirmado, que por criticidad intenta salir igualmente.
+         * Asi el FPort 4 NUNCA puede quitarle el slot al FPort 2.
+         * ============================================================= */
+        bool data_due = (last_send_ms == 0 ||
+                         (now - last_send_ms) >= (int64_t)LORA_SEND_PERIOD_S * 1000);
 
-            int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,
-                                    sizeof(alert), LORAWAN_MSG_UNCONFIRMED);
-            printk("ALERTA%s disparo=0x%02x activo_ahora=0x%02x -> FPort %d: %d\n",
-                   (alert_pending & ALERT_FIRE) ? " [FUEGO]" : "",
-                   alert_pending, alert_active, FPORT_ALERT, aret);
-            if (aret == 0) {
-                alert_pending = 0;      /* enviada: limpia lo pendiente */
-                last_alert_ms = now;
-            }
-            /* si falla (p.ej. -111 duty-cycle) queda pendiente y reintenta luego */
-        }
-
-        /* LoRa: solo en su cadencia, respetando el duty-cycle. Se arma el
-           payload con el PROMEDIO de la ventana y se resetea el acumulador. */
-        if (last_send_ms == 0 || (now - last_send_ms) >= (int64_t)LORA_SEND_PERIOD_S * 1000) {
+        /* ---- 1) DATOS (FPort 2) — MAXIMA PRIORIDAD ------------------- */
+        if (data_due) {
             memset(&payload, 0, sizeof(payload));
 
             if (acc.bm_n > 0) {
@@ -696,11 +715,19 @@ int main(void)
                 payload.flags |= FLAG_SEN65_OK;
             }
 
-            printk("SEND avg (bm=%u co=%u sen=%u muestras)\n",
-                   acc.bm_n, acc.co_n, acc.sen_n);
+            /* Keepalive: 1 de cada LINK_KEEPALIVE_EVERY envios va CONFIRMED
+               para obtener ACK y comprobar que el enlace sigue vivo. El resto
+               UNCONFIRMED (mas barato, sin espera de ACK). */
+            data_send_count++;
+            bool keepalive = (data_send_count % LINK_KEEPALIVE_EVERY) == 0;
+
+            printk("SEND avg (bm=%u co=%u sen=%u muestras)%s\n",
+                   acc.bm_n, acc.co_n, acc.sen_n,
+                   keepalive ? " [keepalive/CONFIRMED]" : "");
 
             ret = lorawan_send(FPORT_DATA, (uint8_t *)&payload, sizeof(payload),
-                               LORAWAN_MSG_UNCONFIRMED);
+                               keepalive ? LORAWAN_MSG_CONFIRMED
+                                         : LORAWAN_MSG_UNCONFIRMED);
             if (ret < 0) {
                 /* -111 (duty-cycle) es normal/regulatorio en EU868, no fatal. */
                 printk("SEND ERR: %d\n", ret);
@@ -709,6 +736,71 @@ int main(void)
             }
             last_send_ms = now;
             memset(&acc, 0, sizeof(acc));   /* nueva ventana de promediado */
+
+            /* Prueba de vida del enlace: un keepalive CONFIRMED que devuelve 0
+               = ACK recibido = enlace vivo. Si falla, cuenta; tras LINK_MAX_FAILS
+               seguidos se asume enlace muerto y se hace REJOIN (a SF12). */
+            if (keepalive) {
+                if (ret == 0) {
+                    if (link_fails > 0) {
+                        printk("ENLACE OK (keepalive con ACK), fails=0\n");
+                    }
+                    link_fails = 0;
+                } else {
+                    link_fails++;
+                    printk("KEEPALIVE sin ACK (%d/%d) ret=%d\n",
+                           link_fails, LINK_MAX_FAILS, ret);
+                    if (link_fails >= LINK_MAX_FAILS) {
+                        printk("ENLACE CAIDO -> REJOIN\n");
+                        for (int a = 1; a <= 3; a++) {
+                            int jr = lorawan_join(&join_cfg);
+                            if (jr == 0) {
+                                printk("REJOIN OK (intento %d)\n", a);
+                                break;
+                            }
+                            printk("REJOIN ERR %d (intento %d/3)\n", jr, a);
+                            k_sleep(K_SECONDS(10));
+                        }
+                        link_fails = 0;   /* re-armar; si sigue mal, reintenta */
+                    }
+                }
+            }
+        }
+
+        /* ---- 2) ALERTAS (FPort 4) — SECUNDARIO, NO BLOQUEANTE -------
+         * Se envia DESPUES de los datos y solo si este ciclo NO tocaba
+         * enviar datos (protege el slot de duty-cycle del FPort 2). Un
+         * FUEGO confirmado es la unica excepcion: intenta salir aunque
+         * coincida con un envio de datos.
+         *
+         * Nunca bloquea al FPort 2: si el envio de alerta falla (p.ej.
+         * -111 duty-cycle), la alerta queda PENDIENTE (alert_pending) y
+         * se reintenta en un ciclo posterior; el bucle de lectura y el
+         * envio periodico de datos siguen su marcha con normalidad.
+         */
+        bool alert_slot_ok = (!data_due || fire_now);
+        bool cooldown_ok   = (fire_now || last_alert_ms == 0 ||
+                              (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000);
+
+        if (alert_pending != 0 && alert_slot_ok && cooldown_ok) {
+            /* El mask reporta que umbrales CRUZARON en la ventana (pending),
+               nunca 0; alert_active es solo informativo (que sigue alto ahora). */
+            alert.alert_mask = alert_pending;
+
+            int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,
+                                    sizeof(alert), LORAWAN_MSG_UNCONFIRMED);
+            printk("ALERTA%s disparo=0x%02x activo_ahora=0x%02x -> FPort %d: %d\n",
+                   (alert_pending & ALERT_FIRE) ? " [FUEGO]" : "",
+                   alert_pending, alert_active, FPORT_ALERT, aret);
+            if (aret == 0) {
+                alert_pending = 0;      /* enviada: limpia lo pendiente */
+                last_alert_ms = now;
+            }
+            /* si falla queda pendiente y reintenta luego, SIN tocar el FPort 2 */
+        } else if (alert_pending != 0) {
+            /* Diagnostico: por que se aplaza la alerta (nunca se pierde). */
+            printk("ALERTA aplazada pend=0x%02x (data_due=%d cooldown_ok=%d)\n",
+                   alert_pending, (int)data_due, (int)cooldown_ok);
         }
 
         k_sleep(K_SECONDS(SENSOR_READ_PERIOD_S));
