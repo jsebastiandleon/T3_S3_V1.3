@@ -22,7 +22,7 @@ extern void captive_dns_start(void);
 
 #define AP_IP      "192.168.4.1"
 #define AP_NETMASK "255.255.255.0"
-#define AP_SSID    "Gesinen_WildFire"   /* nombre fijo de la red del portal */
+#define AP_SSID    "Gandia_WildFire"   /* nombre fijo de la red del portal */
 /* AP ABIERTO: sin contrasena (WIFI_SECURITY_TYPE_NONE). El usuario se conecta
    sin teclear clave y el portal cautivo se abre solo. */
 
