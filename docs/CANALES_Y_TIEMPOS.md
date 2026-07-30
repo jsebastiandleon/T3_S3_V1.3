@@ -14,7 +14,7 @@ tipo, para que en ChirpStack puedas **enrutar/actuar cada uno por separado**
 | **2** `FPORT_DATA` | uplink | Datos de sensores (promedio), 29 B | cada `LORA_SEND_PERIOD_S` |
 | **3** `FPORT_SOS` | uplink | `"SOS"` (3 B) del botón del portal | al pulsar el botón (≤1 ciclo) |
 | **4** `FPORT_ALERT` | uplink | Alerta por umbral (15 B) | al cruzar un umbral (flanco) |
-| **5** `FPORT_DIAG` | uplink | Salud del nodo (13 B) | una vez por arranque |
+| **5** `FPORT_DIAG` | uplink | Salud del nodo (13/14 B) | al arrancar y al caer/recuperarse un sensor |
 | **10** `PORTAL_HTML_OTA_FPORT` | downlink | Actualización OTA del HTML | cuando mandas el downlink |
 
 Los FPort de subida se definen arriba de `main.c`:
@@ -28,10 +28,20 @@ Los FPort de subida se definen arriba de `main.c`:
 
 ### FPort 5 — salud del nodo
 
-Existe porque **un reinicio era invisible desde el servidor**: el nodo volvía,
-hacía OTAA y el único rastro era un `devAddr` nuevo y un `fCnt` desde cero. En
-los logs del 2026-07-29 hubo dos reinicios en 11 minutos y 10 h de silencio sin
-que nada lo señalara.
+Existe porque **el fallo era invisible desde el servidor**. Dos casos:
+
+- Un **reinicio**: el nodo volvía, hacía OTAA y el único rastro era un `devAddr`
+  nuevo y un `fCnt` desde cero. En los logs del 2026-07-29 hubo dos reinicios en
+  11 minutos y 10 h de silencio sin que nada lo señalara.
+- Un **sensor caído**: su criterio desaparecía del multicriterio EN 54-30/31 sin
+  ninguna señal. El nodo seguía diciendo "todo bien" con la capacidad de
+  detección mermada; el único indicio era un bit a 0 en el byte 0 del FPort 2,
+  que nadie vigila.
+
+El primer byte del payload es el **`msg_type`**: `1` = arranque, `2` = fallo de
+sensor.
+
+#### `msg_type = 1` — arranque (13 B)
 
 | Campo | Bytes | Contenido |
 |---|---|---|
@@ -48,9 +58,42 @@ que nada lo señalara.
 
 Se envía **CONFIRMED** (evento único: si se pierde, la causa se pierde con él) y
 con **prioridad mínima**: sólo sale si en ese ciclo no tocaba enviar datos, no hay
-alerta pendiente y han pasado `DIAG_MIN_SPACING_S` (150 s) desde el último envío.
-Nunca puede robarle airtime al FPort 2 ni a una alarma. Tras
-`DIAG_MAX_ATTEMPTS` (5) intentos sin ACK se abandona.
+alerta ni fallo pendiente, y han pasado `DIAG_MIN_SPACING_S` (150 s) desde el
+último envío. Nunca puede robarle airtime al FPort 2, a una alarma ni a una señal
+de avería. Tras `DIAG_MAX_ATTEMPTS` (5) intentos sin ACK se abandona.
+
+#### `msg_type = 2` — fallo de sensor (14 B)
+
+| Campo | Bytes | Contenido |
+|---|---|---|
+| `msg_type` | [0] | 2 = fallo de sensor |
+| `faulted` | [1] | quién está en fallo **ahora** (verdad de campo, útil aunque se pierda un reporte anterior) |
+| `went_down` | [2] | transiciones OK→FALLO desde el último reporte |
+| `came_up` | [3] | transiciones FALLO→OK desde el último reporte |
+| `uptime_s` | [4-7] | segundos desde el arranque |
+| `bm_fails` | [8-9] | lecturas fallidas acumuladas del BM688 |
+| `co_fails` | [10-11] | íd. ZE15-CO |
+| `sen_fails` | [12-13] | íd. SEN65 |
+
+Los tres *mask* usan **los mismos bits que el byte 0 del FPort 2**: bit0 BM688,
+bit1 ZE15-CO, bit3 SEN65.
+
+Un sensor se declara en fallo tras `FAULT_CONSEC_FAILS` (3) lecturas fallidas
+**seguidas** — no a la primera, porque las lecturas fallan de forma esporádica
+por ruido en el bus y declarar al primer fallo daría falsas señales de avería.
+
+Prioridad: **por debajo de los datos y de las alarmas** (una alarma de incendio
+manda sobre una señal de avería, igual que en EN 54) pero **por encima del DIAG
+de arranque**, y con una separación mucho más corta (`FAULT_MIN_SPACING_S`, 30 s):
+una avería es un evento de seguridad y debe salir pronto. Va **CONFIRMED** y queda
+pendiente hasta que hay ACK — si esta señal se pierde, el sistema vuelve a estar
+degradado en silencio, que es justo el defecto que este canal elimina.
+
+Los contadores acumulados distinguen una avería **intermitente** (contador que
+crece sin que el sensor llegue a caer) de una **dura** (cae y no vuelve).
+
+> En el SCADA, `degraded: true` del decoder debe generar aviso: significa que el
+> nodo está detectando con menos criterios de los que debería.
 
 > **`FW_VERSION` hay que subirlo en cada firmware que se flashee.** Sin eso no se
 > puede saber qué código corre en un nodo desplegado — que es exactamente lo que
@@ -98,20 +141,30 @@ Están desacopladas a propósito:
 
 ### Esquema del lazo (simplificado)
 
+Todo comparte **una sola radio** y **un solo presupuesto de duty-cycle**, así que
+el orden del lazo *es* la política de prioridad:
+
 ```
 while (1) {
-    if (SOS pendiente)        -> lorawan_send(FPORT_SOS,...)     // inmediato
+    if (SOS pendiente)  -> lorawan_send(FPORT_SOS,...)          // inmediato
     leer BM688 / ZE15-CO / SEN65
-    acumular (sumas + contador)   y   publicar lectura al portal
+      -> acumular (sumas + contador), publicar al portal
+      -> actualizar SALUD: 3 fallos seguidos = sensor EN FALLO
     now = k_uptime_get()
-    revisar UMBRALES  -> si cruza, lorawan_send(FPORT_ALERT,...) // con cooldown
-    if (now - last_send >= LORA_SEND_PERIOD_S) {
-        payload = promedio(acumulador);  lorawan_send(FPORT_DATA,...)
-        reset acumulador
-    }
+    revisar UMBRALES (+ rate-of-rise EN 54-5, multicriterio EN 54-30/31)
+
+    // --- por orden de prioridad de airtime ---
+    1) DATOS   FPort 2  si toca por LORA_SEND_PERIOD_S      <- SIEMPRE PRIMERO
+    2) ALERTA  FPort 4  si hay pendiente y no tocaban datos  (salvo FUEGO)
+    3) FALLO   FPort 5  si un sensor cayo/volvio             (>= 30 s de hueco)
+    4) BOOT    FPort 5  una vez por arranque                 (>= 150 s de hueco)
+
     k_sleep(SENSOR_READ_PERIOD_S)
 }
 ```
+
+Cada nivel sólo transmite si los de arriba no reclaman la radio en ese ciclo. Lo
+que no sale queda **pendiente** y se reintenta; nada se descarta en silencio.
 
 ### Cuántas muestras entran en cada envío
 Nominalmente `LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S`. Con 720/5 = 144

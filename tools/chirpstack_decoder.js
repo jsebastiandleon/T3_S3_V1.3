@@ -51,39 +51,80 @@ function decodeUplink(input) {
     }};
   }
 
-  // FPort 5 = SALUD DEL NODO. 13 bytes. Hoy solo msg_type 1 (arranque).
-  // Este canal existe para que un reinicio deje de ser invisible: sin el, el
-  // unico rastro de que el nodo se ha reiniciado es un devAddr nuevo.
+  // FPort 5 = SALUD DEL NODO. El primer byte es el msg_type:
+  //   1 = BOOT  (13 B) — por que ha arrancado el nodo y que firmware lleva
+  //   2 = FAULT (14 B) — un sensor ha caido o se ha recuperado
+  // Este canal existe para que un reinicio y una averia dejen de ser
+  // invisibles: sin el, el nodo sigue diciendo "todo bien" con la capacidad
+  // de deteccion mermada, y un reinicio solo deja un devAddr nuevo.
   if (input.fPort === 5) {
-    if (b.length < 13) {
-      return { errors: ["diag demasiado corto: " + b.length + " (esperado 13)"] };
+    if (b.length < 1) {
+      return { errors: ["diag vacio"] };
     }
-    if (b[0] !== 1) {
-      return { errors: ["msg_type de diag desconocido: " + b[0]] };
+
+    // Mascara de sensores: mismos bits que el byte 0 del FPort 2.
+    function sensorMask(m) {
+      return { bm688: (m & 0x01) !== 0, ze15co: (m & 0x02) !== 0,
+               sen65: (m & 0x08) !== 0 };
     }
-    var causes = ["UNKNOWN", "POR", "PIN", "SOFTWARE", "WATCHDOG",
-                  "LOW_POWER_WAKE", "CPU_LOCKUP", "BROWNOUT"];
-    var code = b[1];
-    var fw   = u16(10);
-    var sens = b[12];
-    return { data: {
-      event:       "BOOT",
-      reset_cause: causes[code] || ("INVALID_" + code),
-      reset_code:  code,
-      reset_raw:   u32(2),
-      boot_count:  u32(6),
-      // Alimentacion o software: es la pregunta que este canal resuelve.
-      suspect:     (code === 7) ? "power"
-                 : (code === 6) ? "firmware"
-                 : (code === 4) ? "watchdog"
-                 : "normal",
-      fw_version:  "v" + (fw >> 8) + "." + (fw & 0xFF),
-      sensors_at_boot: {
-        bm688:  (sens & 0x01) !== 0,
-        ze15co: (sens & 0x02) !== 0,
-        sen65:  (sens & 0x08) !== 0
+    function sensorNames(m) {
+      var n = [];
+      if (m & 0x01) { n.push("bm688"); }
+      if (m & 0x02) { n.push("ze15co"); }
+      if (m & 0x08) { n.push("sen65"); }
+      return n;
+    }
+
+    if (b[0] === 1) {
+      if (b.length < 13) {
+        return { errors: ["diag BOOT corto: " + b.length + " (esperado 13)"] };
       }
-    }};
+      var causes = ["UNKNOWN", "POR", "PIN", "SOFTWARE", "WATCHDOG",
+                    "LOW_POWER_WAKE", "CPU_LOCKUP", "BROWNOUT"];
+      var code = b[1];
+      var fw   = u16(10);
+      return { data: {
+        event:       "BOOT",
+        reset_cause: causes[code] || ("INVALID_" + code),
+        reset_code:  code,
+        reset_raw:   u32(2),
+        boot_count:  u32(6),
+        // Alimentacion o software: es la pregunta que este canal resuelve.
+        suspect:     (code === 7) ? "power"
+                   : (code === 6) ? "firmware"
+                   : (code === 4) ? "watchdog"
+                   : "normal",
+        fw_version:  "v" + (fw >> 8) + "." + (fw & 0xFF),
+        sensors_at_boot: sensorMask(b[12])
+      }};
+    }
+
+    if (b[0] === 2) {
+      if (b.length < 14) {
+        return { errors: ["diag FAULT corto: " + b.length + " (esperado 14)"] };
+      }
+      var nowFaulted = b[1];
+      var down = b[2];
+      var up   = b[3];
+      return { data: {
+        event:          "SENSOR_FAULT",
+        // degraded = el nodo esta detectando con menos criterios de los que
+        // deberia. Es la condicion que debe disparar aviso en el SCADA.
+        degraded:       nowFaulted !== 0,
+        faulted:        sensorMask(nowFaulted),
+        faulted_list:   sensorNames(nowFaulted),
+        went_down:      sensorNames(down),
+        came_up:        sensorNames(up),
+        uptime_s:       u32(4),
+        total_failed_reads: {
+          bm688:  u16(8),
+          ze15co: u16(10),
+          sen65:  u16(12)
+        }
+      }};
+    }
+
+    return { errors: ["msg_type de diag desconocido: " + b[0]] };
   }
 
   if (b.length < 29) {

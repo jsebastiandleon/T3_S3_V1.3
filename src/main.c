@@ -136,7 +136,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0201   /* v2.1 — anade FPORT_DIAG de arranque */
+#define FW_VERSION    0x0202   /* v2.2 — señal de fallo de sensor (FPORT_DIAG) */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -192,6 +192,20 @@ static void i2c1_scan(void)
    (la causa del reset queda igualmente en la consola y en boot_count). */
 #define DIAG_MIN_SPACING_S    150
 #define DIAG_MAX_ATTEMPTS     5
+
+/* =======================================================================
+ *  SEÑAL DE FALLO DE SENSOR  (FPORT_DIAG, msg_type 2)
+ * =======================================================================
+ * FAULT_CONSEC_FAILS: lecturas fallidas SEGUIDAS antes de declarar un sensor
+ *   en fallo. Las lecturas fallan de forma esporadica (ruido en el bus, una
+ *   trama perdida del ZE15-CO), asi que declarar a la primera daria falsas
+ *   señales de averia. 3 es el mismo umbral que ya usaba el ZE15-CO.
+ * FAULT_MIN_SPACING_S: separacion minima entre reportes de fallo. Mucho mas
+ *   corto que el del DIAG de arranque porque un fallo de sensor es un evento
+ *   de seguridad y debe salir pronto; si el duty-cycle lo rechaza (a SF12),
+ *   queda pendiente y se reintenta sin coste de airtime. */
+#define FAULT_CONSEC_FAILS    3
+#define FAULT_MIN_SPACING_S   30
 
 /* =======================================================================
  *  NORMA EN 54-5 — RATE-OF-RISE TERMICO
@@ -279,6 +293,58 @@ static const char *reset_cause_str(uint8_t code)
     case RSTC_LOCKUP:   return "CPU LOCKUP (panic)";
     case RSTC_BROWNOUT: return "BROWNOUT (caida de tension)";
     default:            return "DESCONOCIDA";
+    }
+}
+
+/* =======================================================================
+ *  SALUD POR SENSOR
+ * =======================================================================
+ * Hasta ahora, si un sensor dejaba de responder su criterio de deteccion
+ * desaparecia del multicriterio EN 54-30/31 SIN ninguna señal: el nodo seguia
+ * diciendo "todo bien" con la capacidad de deteccion mermada. El unico indicio
+ * era un bit a 0 en el byte 0 del FPort 2, que nadie vigila. */
+struct sensor_health {
+    uint16_t consec_fails;  /* fallos seguidos ahora mismo   */
+    uint16_t total_fails;   /* acumulado (satura en 0xFFFF)  */
+    bool     faulted;       /* declarado en fallo            */
+};
+
+/*
+ * Registra el resultado de una lectura y actualiza el estado de fallo.
+ *   ok        - la lectura fue valida
+ *   bit       - identificador del sensor (mismos bits que el byte 0 del FPort 2)
+ *   down/up   - mascaras de transiciones aun sin reportar; se acumulan con |=
+ *               para que una caida y una recuperacion simultaneas convivan.
+ *
+ * Un sensor se declara EN FALLO tras FAULT_CONSEC_FAILS lecturas fallidas
+ * SEGUIDAS, no a la primera: las lecturas fallan de forma esporadica (ruido en
+ * el bus, una trama perdida del ZE15-CO) y declarar al primer fallo daria
+ * falsas señales de averia.
+ */
+static void health_update(struct sensor_health *h, bool ok, uint8_t bit,
+                          uint8_t *down, uint8_t *up)
+{
+    if (ok) {
+        h->consec_fails = 0;
+        if (h->faulted) {
+            h->faulted = false;
+            *up |= bit;
+            printk("SALUD: sensor 0x%02x RECUPERADO\n", bit);
+        }
+        return;
+    }
+
+    if (h->consec_fails < UINT16_MAX) {
+        h->consec_fails++;
+    }
+    if (h->total_fails < UINT16_MAX) {
+        h->total_fails++;
+    }
+    if (!h->faulted && h->consec_fails >= FAULT_CONSEC_FAILS) {
+        h->faulted = true;
+        *down |= bit;
+        printk("SALUD: sensor 0x%02x EN FALLO (%u lecturas seguidas)\n",
+               bit, (unsigned int)h->consec_fails);
     }
 }
 
@@ -581,15 +647,43 @@ int main(void)
                                 (sen65_dev  != NULL ? FLAG_SEN65_OK : 0)),
     };
 
-    /* El DIAG es de MINIMA prioridad: nunca debe robarle airtime al FPort 2
-       ni a una alerta. Va CONFIRMED porque es un evento unico e irrepetible
-       (si se pierde, la causa del reinicio se pierde con el), y por eso
-       'ret == 0' aqui significa ACK recibido, no solo "transmitido". */
+    /*
+     * Payload de FALLO DE SENSOR (FPORT_DIAG, msg_type 2, 14 bytes, LE).
+     * Convierte la degradacion SILENCIOSA en degradacion ANUNCIADA.
+     *   [0]     uint8  msg_type = 2 (FAULT)
+     *   [1]     uint8  faulted   — quien esta en fallo AHORA (verdad de campo,
+     *                              util aunque se pierda un reporte anterior)
+     *   [2]     uint8  went_down — transiciones OK->FALLO desde el ultimo reporte
+     *   [3]     uint8  came_up   — transiciones FALLO->OK desde el ultimo reporte
+     *   [4-7]   uint32 uptime_s
+     *   [8-9]   uint16 fallos totales BM688   (desde el arranque)
+     *   [10-11] uint16 fallos totales ZE15-CO
+     *   [12-13] uint16 fallos totales SEN65
+     * Los tres mask usan los mismos bits que el byte 0 del FPort 2:
+     * bit0 BM688, bit1 ZE15-CO, bit3 SEN65.
+     */
+    struct {
+        uint8_t  msg_type;
+        uint8_t  faulted;
+        uint8_t  went_down;
+        uint8_t  came_up;
+        uint32_t uptime_s;
+        uint16_t bm_fails;
+        uint16_t co_fails;
+        uint16_t sen_fails;
+    } __packed fault = { .msg_type = 2 };
+
     /* El formato en el aire es un contrato con el decoder de ChirpStack: si
        el compilador metiese padding, el servidor decodificaria basura sin que
        nada fallase visiblemente. Que rompa la compilacion, no el diagnostico. */
-    BUILD_ASSERT(sizeof(diag) == 13, "FPORT_DIAG debe ocupar 13 bytes");
+    BUILD_ASSERT(sizeof(diag)  == 13, "FPORT_DIAG BOOT debe ocupar 13 bytes");
+    BUILD_ASSERT(sizeof(fault) == 14, "FPORT_DIAG FAULT debe ocupar 14 bytes");
 
+    /* El DIAG de arranque es de MINIMA prioridad: nunca debe robarle airtime
+       al FPort 2, a una alerta ni a una señal de averia. Va CONFIRMED porque
+       es un evento unico e irrepetible (si se pierde, la causa del reinicio se
+       pierde con el), y por eso 'ret == 0' aqui significa ACK recibido, no
+       solo "transmitido". */
     bool    diag_pending  = true;
     int64_t last_diag_ms  = 0;
     int     diag_attempts = 0;
@@ -620,7 +714,21 @@ int main(void)
     memset(&acc, 0, sizeof(acc));
 
     int64_t last_send_ms = 0;
-    int co_fails = 0;   /* tras 3 fallos seguidos se deja de leer el CO */
+
+    /* Salud por sensor. Un sensor que no llego a inicializarse nace YA en
+       fallo: si no, la mascara 'faulted' del reporte lo daria por sano
+       simplemente porque nunca se le lee. Eso no genera transicion (nunca
+       estuvo OK); su ausencia la reporta el mensaje de arranque. */
+    struct sensor_health h_bm  = { .faulted = (bm688_dev == NULL) };
+    struct sensor_health h_co  = { .faulted = (co_dev    == NULL) };
+    struct sensor_health h_sen = { .faulted = (sen65_dev == NULL) };
+
+    /* Transiciones acumuladas aun sin reportar. Se acumulan (|=) en vez de
+       sobrescribirse: si un sensor cae y otro se recupera antes de que la
+       radio quede libre, el reporte lleva ambas cosas. */
+    uint8_t fault_down_pending = 0;   /* OK   -> FALLO */
+    uint8_t fault_up_pending   = 0;   /* FALLO-> OK    */
+    int64_t last_fault_ms      = 0;
 
     /* Supervision del enlace: cuenta de envios de datos (para el keepalive) y
        de keepalives consecutivos sin ACK (para disparar el rejoin). */
@@ -674,6 +782,8 @@ int main(void)
             } else {
                 printk("BM688 READ ERR: %d\n", r);
             }
+            health_update(&h_bm, r == 0, FLAG_BM688_OK,
+                          &fault_down_pending, &fault_up_pending);
         }
 
         /* ZE15-CO (si esta presente) -> fluye al portal aunque falte el BM688.
@@ -682,20 +792,28 @@ int main(void)
         if (co_dev != NULL) {
             struct ze15co_data cd;
             int cr = ze15co_read(co_dev, &cd);
-            if (cr == 0 && !cd.sensor_fault) {
+            bool co_ok = (cr == 0 && !cd.sensor_fault);
+
+            if (co_ok) {
                 acc.co_sum += cd.co_ppm;
                 acc.co_n++;
                 ps.co_valid = true;
                 ps.co_ppm   = cd.co_ppm;
-                co_fails = 0;
-            } else {
-                if (cr == 0 && cd.sensor_fault) {
-                    acc.co_fault_seen = true;  /* sensor reporta fallo interno */
-                }
-                if (++co_fails >= 3) {
-                    printk("ZE15-CO: 3 fallos seguidos, se deshabilita la lectura\n");
-                    co_dev = NULL;
-                }
+            } else if (cr == 0 && cd.sensor_fault) {
+                acc.co_fault_seen = true;  /* sensor reporta fallo interno */
+            }
+            health_update(&h_co, co_ok, FLAG_CO_OK,
+                          &fault_down_pending, &fault_up_pending);
+
+            /* PENDIENTE (Fase 1, paso siguiente): esta deshabilitacion es
+               IRREVERSIBLE — sin reintento no hay forma de recuperar el CO sin
+               reiniciar el nodo. De momento, al menos ya no es muda: el
+               health_update() de arriba ha marcado la transicion y el reporte
+               sale por FPORT_DIAG. */
+            if (h_co.consec_fails >= FAULT_CONSEC_FAILS) {
+                printk("ZE15-CO: %u fallos seguidos, se deshabilita la lectura\n",
+                       (unsigned int)h_co.consec_fails);
+                co_dev = NULL;
             }
         }
 
@@ -726,6 +844,8 @@ int main(void)
             } else {
                 printk("SEN65 READ ERR: %d\n", ar);
             }
+            health_update(&h_sen, ar == 0, FLAG_SEN65_OK,
+                          &fault_down_pending, &fault_up_pending);
         }
 
         /* Portal: siempre actualizado (lo sirve /api/sensors). */
@@ -986,14 +1106,60 @@ int main(void)
                    alert_pending, (int)data_due, (int)cooldown_ok);
         }
 
-        /* ---- 3) DIAGNOSTICO DE ARRANQUE (FPort 5) — MINIMA PRIORIDAD -
+        /* ---- 3) FALLO DE SENSOR (FPort 5, msg_type 2) ----------------
+         * Se envia cuando algun sensor CAE o se RECUPERA. Va por debajo de
+         * los datos y de las alarmas (una alarma de incendio manda sobre una
+         * señal de averia, igual que en EN 54), pero por encima del DIAG de
+         * arranque y con una separacion mucho mas corta: una averia es un
+         * evento de seguridad y debe salir pronto.
+         *
+         * CONFIRMED y pendiente hasta que hay ACK: si esta señal se pierde,
+         * el sistema vuelve a estar degradado en silencio, que es justo el
+         * defecto que este canal existe para eliminar.
+         */
+        bool fault_pending = (fault_down_pending | fault_up_pending) != 0;
+
+        if (fault_pending && !data_due && alert_pending == 0 &&
+            (now - last_send_ms) >= (int64_t)FAULT_MIN_SPACING_S * 1000 &&
+            (last_fault_ms == 0 ||
+             (now - last_fault_ms) >= (int64_t)FAULT_MIN_SPACING_S * 1000)) {
+
+            last_fault_ms = now;
+
+            fault.faulted   = (uint8_t)((h_bm.faulted  ? FLAG_BM688_OK : 0) |
+                                        (h_co.faulted  ? FLAG_CO_OK    : 0) |
+                                        (h_sen.faulted ? FLAG_SEN65_OK : 0));
+            fault.went_down = fault_down_pending;
+            fault.came_up   = fault_up_pending;
+            fault.uptime_s  = (uint32_t)(now / 1000);
+            fault.bm_fails  = h_bm.total_fails;
+            fault.co_fails  = h_co.total_fails;
+            fault.sen_fails = h_sen.total_fails;
+
+            int fret = lorawan_send(FPORT_DIAG, (uint8_t *)&fault,
+                                    sizeof(fault), LORAWAN_MSG_CONFIRMED);
+            printk("FALLO caidos=0x%02x recuperados=0x%02x en_fallo_ahora=0x%02x"
+                   " -> FPort %d: %d\n",
+                   fault.went_down, fault.came_up, fault.faulted,
+                   FPORT_DIAG, fret);
+
+            if (fret == 0) {
+                /* Solo se limpia lo que se acaba de reportar: si una nueva
+                   transicion ocurrio durante el envio, no se pierde. */
+                fault_down_pending &= ~fault.went_down;
+                fault_up_pending   &= ~fault.came_up;
+            }
+        }
+
+        /* ---- 4) DIAGNOSTICO DE ARRANQUE (FPort 5) — MINIMA PRIORIDAD -
          * Sale UNA vez por arranque y solo cuando la radio esta libre: ni
-         * este ciclo tocaba enviar datos, ni hay ninguna alerta pendiente,
+         * este ciclo tocaba enviar datos, ni hay alerta o fallo pendiente,
          * y ha pasado DIAG_MIN_SPACING_S desde el ultimo envio de datos y
          * desde el intento anterior. Asi el instrumento de diagnostico no
-         * puede degradar jamas al canal critico ni a una alarma.
+         * puede degradar jamas al canal critico, a una alarma ni a una
+         * señal de averia.
          */
-        if (diag_pending && !data_due && alert_pending == 0 &&
+        if (diag_pending && !data_due && alert_pending == 0 && !fault_pending &&
             (now - last_send_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000 &&
             (last_diag_ms == 0 ||
              (now - last_diag_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000)) {
