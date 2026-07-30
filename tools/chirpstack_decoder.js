@@ -76,21 +76,30 @@ function decodeUplink(input) {
     }
 
     if (b[0] === 1) {
-      if (b.length < 13) {
-        return { errors: ["diag BOOT corto: " + b.length + " (esperado 13)"] };
+      if (b.length < 14) {
+        return { errors: ["diag BOOT corto: " + b.length + " (esperado 14)"] };
       }
       var causes = ["UNKNOWN", "POR", "PIN", "SOFTWARE", "WATCHDOG",
-                    "LOW_POWER_WAKE", "CPU_LOCKUP", "BROWNOUT"];
+                    "LOW_POWER_WAKE", "CPU_LOCKUP", "BROWNOUT",
+                    "USB_JTAG", "PWR_GLITCH"];
+      // esp_reset_reason() en crudo. hwinfo de Zephyr solo traduce 9 de estas
+      // 16, y entre las que se deja esta PWR_GLITCH — la que importa en un
+      // nodo solar. Por eso el nodo manda tambien el valor del SoC.
+      var socNames = ["UNKNOWN", "POWERON", "EXT", "SW", "PANIC", "INT_WDT",
+                      "TASK_WDT", "WDT", "DEEPSLEEP", "BROWNOUT", "SDIO",
+                      "USB", "JTAG", "EFUSE", "PWR_GLITCH", "CPU_LOCKUP"];
       var code = b[1];
       var fw   = u16(10);
+      var soc  = b[13];
       return { data: {
         event:       "BOOT",
         reset_cause: causes[code] || ("INVALID_" + code),
         reset_code:  code,
         reset_raw:   u32(2),
+        soc_reason:  socNames[soc] || ("INVALID_" + soc),
         boot_count:  u32(6),
         // Alimentacion o software: es la pregunta que este canal resuelve.
-        suspect:     (code === 7) ? "power"
+        suspect:     (code === 7 || code === 9) ? "power"
                    : (code === 6) ? "firmware"
                    : (code === 4) ? "watchdog"
                    : "normal",

@@ -14,7 +14,7 @@ tipo, para que en ChirpStack puedas **enrutar/actuar cada uno por separado**
 | **2** `FPORT_DATA` | uplink | Datos de sensores (promedio), 29 B | cada `LORA_SEND_PERIOD_S` |
 | **3** `FPORT_SOS` | uplink | `"SOS"` (3 B) del botón del portal | al pulsar el botón (≤1 ciclo) |
 | **4** `FPORT_ALERT` | uplink | Alerta por umbral (15 B) | al cruzar un umbral (flanco) |
-| **5** `FPORT_DIAG` | uplink | Salud del nodo (13/14 B) | al arrancar y al caer/recuperarse un sensor |
+| **5** `FPORT_DIAG` | uplink | Salud del nodo (14 B) | al arrancar y al caer/recuperarse un sensor |
 | **10** `PORTAL_HTML_OTA_FPORT` | downlink | Actualización OTA del HTML | cuando mandas el downlink |
 
 Los FPort de subida se definen arriba de `main.c`:
@@ -41,19 +41,29 @@ Existe porque **el fallo era invisible desde el servidor**. Dos casos:
 El primer byte del payload es el **`msg_type`**: `1` = arranque, `2` = fallo de
 sensor.
 
-#### `msg_type = 1` — arranque (13 B)
+#### `msg_type = 1` — arranque (14 B)
 
 | Campo | Bytes | Contenido |
 |---|---|---|
 | `msg_type` | [0] | 1 = arranque |
-| `reset_code` | [1] | 0 desconocida · 1 POR · 2 PIN · 3 SW · 4 WDT · 5 low-power · **6 CPU lockup** · **7 brownout** |
+| `reset_code` | [1] | 0 desconocida · 1 POR · 2 PIN · 3 SW · 4 WDT · 5 low-power · **6 CPU lockup** · **7 brownout** · 8 USB/JTAG · **9 pinchazo de alimentación** |
 | `reset_raw` | [2-5] | máscara cruda de `hwinfo` |
 | `boot_count` | [6-9] | contador persistente en NVS (`diag/boots`) |
 | `fw_version` | [10-11] | `FW_VERSION` de `main.c` |
 | `sensors_ok` | [12] | sensores presentes al arrancar (bit0 BM688, bit1 CO, bit3 SEN65) |
+| `soc_reason` | [13] | `esp_reset_reason()` en crudo (0-15) |
 
-- **`reset_code = 7` (brownout)** → problema de **alimentación** (panel, batería, rail de 5 V).
+- **`reset_code` 7 (brownout) o 9 (pinchazo)** → problema de **alimentación** (panel, batería, rail de 5 V). El decoder los agrupa en `suspect: "power"`.
 - **`reset_code = 6` (CPU lockup)** → **pánico del kernel**, típicamente stack overflow.
+
+> **Por qué se manda además el motivo crudo del SoC.** `hwinfo` no basta: el
+> driver de Zephyr (`zephyr/drivers/hwinfo/hwinfo_esp32.c`) sólo traduce **9 de
+> las 16** causas que define ESP-IDF, y las demás devuelven 0 = *desconocida*.
+> Entre las que se deja está **`ESP_RST_PWR_GLITCH`** — un pinchazo de
+> alimentación, justo la causa que se busca en un nodo solar. Se comprobó en
+> banco: un reset por USB salía como `RESET CAUSE: DESCONOCIDA (raw=0x0)`. Un
+> instrumento ciego precisamente donde importa no sirve, así que el nodo lee
+> también `esp_reset_reason()` y lo usa cuando `hwinfo` no sabe.
 - `boot_count` detecta reinicios **mudos**: si salta de N a N+3, hubo 2 arranques cuyo DIAG no llegó.
 
 Se envía **CONFIRMED** (evento único: si se pierde, la causa se pierde con él) y

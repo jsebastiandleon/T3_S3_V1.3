@@ -13,6 +13,10 @@
 #include "wallclock.h"
 #include "nodewdt.h"
 
+/* Motivo crudo de reset del SoC: hwinfo no cubre todas las causas (ver
+   soc_reason_to_code() mas abajo). */
+#include <esp_system.h>
+
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
    Util para verificar si el bus esta electricamente vivo (pull-ups OK) y
    si el BME688 aparece en 0x76. */
@@ -143,7 +147,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0205   /* v2.5 — perro guardian (WDT hw + lazo) */
+#define FW_VERSION    0x0206   /* v2.6 — causa de reset cruda del SoC */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -311,16 +315,49 @@ static void i2c1_scan(void)
  * ESP32 (zephyr/drivers/hwinfo/hwinfo_esp32.c solo define get_device_id,
  * get_supported_reset_cause y get_reset_cause). No se llama: esp_reset_reason()
  * ya latchea el valor correcto de un arranque al siguiente. */
-#define RSTC_UNKNOWN   0
-#define RSTC_POR       1
-#define RSTC_PIN       2
-#define RSTC_SOFTWARE  3
-#define RSTC_WATCHDOG  4
-#define RSTC_LOWPOWER  5
-#define RSTC_LOCKUP    6
-#define RSTC_BROWNOUT  7
+#define RSTC_UNKNOWN     0
+#define RSTC_POR         1
+#define RSTC_PIN         2
+#define RSTC_SOFTWARE    3
+#define RSTC_WATCHDOG    4
+#define RSTC_LOWPOWER    5
+#define RSTC_LOCKUP      6
+#define RSTC_BROWNOUT    7
+#define RSTC_USB_JTAG    8   /* reset del host: banco, no campo */
+#define RSTC_PWR_GLITCH  9   /* pinchazo de alimentacion */
 
-static uint8_t reset_cause_code(uint32_t raw)
+/*
+ * hwinfo NO basta en este SoC. El driver de Zephyr
+ * (zephyr/drivers/hwinfo/hwinfo_esp32.c) solo traduce 9 de las 16 causas que
+ * define ESP-IDF; el resto caen en 'default' y devuelven 0, o sea DESCONOCIDA.
+ *
+ * Entre las NO mapeadas esta ESP_RST_PWR_GLITCH —un pinchazo de alimentacion—,
+ * que es justo la causa que se busca en un nodo alimentado por panel solar. Se
+ * comprobo en banco: un reset por USB salia como "DESCONOCIDA (raw=0x0)".
+ * Un instrumento ciego precisamente donde importa no sirve, asi que se lee
+ * tambien el motivo crudo del SoC y se usa cuando hwinfo no sabe.
+ */
+static uint8_t soc_reason_to_code(uint32_t soc)
+{
+    switch (soc) {
+    case ESP_RST_POWERON:    return RSTC_POR;
+    case ESP_RST_EXT:        return RSTC_PIN;
+    case ESP_RST_SW:         return RSTC_SOFTWARE;
+    case ESP_RST_PANIC:
+    case ESP_RST_CPU_LOCKUP: return RSTC_LOCKUP;
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:        return RSTC_WATCHDOG;
+    case ESP_RST_DEEPSLEEP:  return RSTC_LOWPOWER;
+    case ESP_RST_BROWNOUT:   return RSTC_BROWNOUT;
+    case ESP_RST_PWR_GLITCH: return RSTC_PWR_GLITCH;
+    case ESP_RST_USB:
+    case ESP_RST_JTAG:       return RSTC_USB_JTAG;
+    default:                 return RSTC_UNKNOWN;
+    }
+}
+
+static uint8_t reset_cause_code(uint32_t raw, uint32_t soc)
 {
     /* Orden por criticidad de diagnostico: brownout y lockup mandan si
        aparecen combinados con otro bit. */
@@ -331,7 +368,9 @@ static uint8_t reset_cause_code(uint32_t raw)
     if (raw & RESET_PIN)            return RSTC_PIN;
     if (raw & RESET_SOFTWARE)       return RSTC_SOFTWARE;
     if (raw & RESET_LOW_POWER_WAKE) return RSTC_LOWPOWER;
-    return RSTC_UNKNOWN;
+
+    /* hwinfo no lo reconoce: preguntar al SoC directamente. */
+    return soc_reason_to_code(soc);
 }
 
 static const char *reset_cause_str(uint8_t code)
@@ -344,6 +383,8 @@ static const char *reset_cause_str(uint8_t code)
     case RSTC_LOWPOWER: return "LOW-POWER WAKE";
     case RSTC_LOCKUP:   return "CPU LOCKUP (panic)";
     case RSTC_BROWNOUT: return "BROWNOUT (caida de tension)";
+    case RSTC_USB_JTAG: return "USB/JTAG (reset del host)";
+    case RSTC_PWR_GLITCH: return "PWR GLITCH (pinchazo de alimentacion)";
     default:            return "DESCONOCIDA";
     }
 }
@@ -460,9 +501,10 @@ int main(void)
     if (hwinfo_get_reset_cause(&reset_raw) < 0) {
         reset_raw = 0;
     }
-    const uint8_t reset_code = reset_cause_code(reset_raw);
-    printk("RESET CAUSE: %s (raw=0x%08x)\n", reset_cause_str(reset_code),
-           reset_raw);
+    const uint32_t soc_reason = (uint32_t)esp_reset_reason();
+    const uint8_t  reset_code  = reset_cause_code(reset_raw, soc_reason);
+    printk("RESET CAUSE: %s (hwinfo=0x%08x soc=%u)\n",
+           reset_cause_str(reset_code), reset_raw, soc_reason);
 
     /* Settings/NVS: hay que inicializar el subsistema ANTES de que nadie
        cargue su subtree. Sin esta llamada, settings_load_subtree() recorre
@@ -705,6 +747,8 @@ int main(void)
      *   [10-11] uint16 fw_version (FW_VERSION)
      *   [12]    uint8  sensors_ok (mismos bits que el byte 0 del FPort 2:
      *                              bit0 BM688, bit1 CO, bit3 SEN65)
+     *   [13]    uint8  soc_reason (esp_reset_reason() en crudo; hwinfo no
+     *                              cubre todas las causas — ver arriba)
      */
     struct {
         uint8_t  msg_type;
@@ -713,6 +757,7 @@ int main(void)
         uint32_t boot_count;
         uint16_t fw_version;
         uint8_t  sensors_ok;
+        uint8_t  soc_reason;
     } __packed diag = {
         .msg_type   = 1,
         .reset_code = reset_code,
@@ -722,6 +767,7 @@ int main(void)
         .sensors_ok = (uint8_t)((bm688_dev  != NULL ? FLAG_BM688_OK : 0) |
                                 (co_dev     != NULL ? FLAG_CO_OK    : 0) |
                                 (sen65_dev  != NULL ? FLAG_SEN65_OK : 0)),
+        .soc_reason = (uint8_t)soc_reason,
     };
 
     /*
@@ -753,7 +799,7 @@ int main(void)
     /* El formato en el aire es un contrato con el decoder de ChirpStack: si
        el compilador metiese padding, el servidor decodificaria basura sin que
        nada fallase visiblemente. Que rompa la compilacion, no el diagnostico. */
-    BUILD_ASSERT(sizeof(diag)  == 13, "FPORT_DIAG BOOT debe ocupar 13 bytes");
+    BUILD_ASSERT(sizeof(diag)  == 14, "FPORT_DIAG BOOT debe ocupar 14 bytes");
     BUILD_ASSERT(sizeof(fault) == 14, "FPORT_DIAG FAULT debe ocupar 14 bytes");
 
     /* El DIAG de arranque es de MINIMA prioridad: nunca debe robarle airtime
