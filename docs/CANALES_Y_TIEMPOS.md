@@ -327,6 +327,61 @@ No hay anulación manual, así que las tres reglas importan:
 
 ---
 
+## 5 ter. Perro guardián
+
+Antes no había **ninguno**: si el lazo principal se bloqueaba —en un mutex, en un
+semáforo sin liberar, en un bucle— el nodo se quedaba mudo indefinidamente
+sirviendo aún el portal WiFi, y nadie se enteraba. Los 10 h de silencio del
+2026-07-29 son compatibles con ese escenario.
+
+`src/nodewdt.c` monta **dos niveles**, porque un solo umbral no sirve:
+
+| Nivel | Qué detecta | Tiempo |
+|---|---|---|
+| WDT hardware alimentado por el hilo supervisor | Cuelgue del sistema entero (kernel muerto, interrupciones desactivadas, inversión de prioridad) | ~20 s |
+| El supervisor vigila que el lazo principal **avance** | Lazo bloqueado aunque el resto del sistema viva | 45 min |
+
+```c
+#define NODEWDT_FEED_S          2        // el supervisor alimenta cada 2 s
+#define NODEWDT_HW_TIMEOUT_MS   20000
+#define NODEWDT_STALL_S         (45*60)  // lazo sin avanzar -> reset
+```
+
+### Por qué el umbral del lazo es tan largo
+
+Porque el lazo se bloquea de forma **legítima** durante mucho tiempo:
+`lorawan_send()` hace `k_sem_take(..., K_FOREVER)` esperando a que el MAC
+termine (`zephyr/subsys/lorawan/loramac-node/lorawan.c:726`), y un uplink
+**CONFIRMED** sin ACK reintenta hasta 8 veces respetando el duty-cycle del 1 %:
+
+| Escenario | Bloqueo |
+|---|---|
+| CONFIRMED sin ACK, LoRaMac bajando el DR cada 2 intentos | ~10 min |
+| CONFIRMED sin ACK clavado en SF12 | ~22 min |
+
+Un watchdog agresivo reiniciaría el nodo en mitad de un envío válido y
+provocaría **bucles de reinicio, que es peor que no tener watchdog**. Y hay un
+segundo motivo, más sutil: un falso reinicio **falsearía el diagnóstico** del
+FPort 5 — ver `RESET CAUSE: WATCHDOG` cuando en realidad hubo un envío largo y
+correcto mandaría a buscar un cuelgue inexistente.
+
+El bucle de join y el de rejoin llaman a `nodewdt_alive()` en cada vuelta:
+reintentar la unión **es progreso**, no un cuelgue, y así un nodo sin cobertura
+durante horas no se reinicia solo.
+
+> La solución de fondo a los bloqueos es sacar la radio a su propio hilo
+> (Fase 3). Hasta entonces, el watchdog se dimensiona alrededor del problema.
+
+### Cierra el círculo con el FPort 5
+
+Un reinicio por watchdog **no es silencioso**: `hwinfo` lo reporta como
+`RESET_WATCHDOG` y el uplink de arranque lo manda al servidor con
+`reset_cause: "WATCHDOG"` y `suspect: "watchdog"`. Por eso el supervisor deja de
+alimentar en vez de llamar a `sys_reboot()`: dejar que muerda el hardware no
+depende de que el kernel siga sano, y además deja la causa registrada.
+
+---
+
 ## 6. El límite que manda: duty-cycle EU868 (1 %)
 
 Aunque leas cada 5 s, no se puede transmitir tan seguido. EU868 permite ocupar

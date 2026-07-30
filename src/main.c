@@ -11,6 +11,7 @@
 #include "sensors/sen6x.h"
 #include "portal/portal.h"
 #include "wallclock.h"
+#include "nodewdt.h"
 
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
    Util para verificar si el bus esta electricamente vivo (pull-ups OK) y
@@ -142,7 +143,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0204   /* v2.4 — el CO se recupera solo (backoff) */
+#define FW_VERSION    0x0205   /* v2.5 — perro guardian (WDT hw + lazo) */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -606,7 +607,16 @@ int main(void)
         },
     };
 
+    /* Perro guardian ANTES del bucle de join: ese bucle puede girar horas si
+       no hay cobertura, y tiene que quedar supervisado igual. Marca vida en
+       cada vuelta, de modo que reintentar el join cuenta como PROGRESO y no
+       provoca reinicios: el nodo esta haciendo justo lo que debe. */
+    if (nodewdt_start() < 0) {
+        printk("AVISO: el nodo arranca SIN perro guardian\n");
+    }
+
     for (int attempt = 1; ; attempt++) {
+        nodewdt_alive();
         printk("JOINING... attempt %d\n", attempt);
         ret = lorawan_join(&join_cfg);
         if (ret == 0) {
@@ -833,6 +843,10 @@ int main(void)
            lecturas pueden tardar varios segundos y la pausa del CO hay que
            evaluarla antes de decidir si se lee. */
         const int64_t cycle_start_ms = k_uptime_get();
+
+        /* "Sigo vivo" para el perro guardian. Va lo PRIMERO del ciclo: marca
+           que el lazo avanza, no que los envios funcionen. */
+        nodewdt_alive();
 
         /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
            en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
@@ -1182,6 +1196,10 @@ int main(void)
                     if (link_fails >= LINK_MAX_FAILS) {
                         printk("ENLACE CAIDO -> REJOIN\n");
                         for (int a = 1; a <= 3; a++) {
+                            /* Reunirse es PROGRESO, no un cuelgue: cada
+                               lorawan_join() bloquea y encadenados podrian
+                               pasar del umbral de estancamiento. */
+                            nodewdt_alive();
                             int jr = lorawan_join(&join_cfg);
                             if (jr == 0) {
                                 printk("REJOIN OK (intento %d)\n", a);
