@@ -4,6 +4,7 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/lorawan/lorawan.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/sys/printk.h>
 #include "sensors/bm688.h"
 #include "sensors/ze15_co.h"
@@ -93,7 +94,13 @@ static void i2c1_scan(void)
  *   lectura, sino el PROMEDIO de todas las lecturas tomadas dentro de la
  *   ventana de envio (LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S muestras).
  * ======================================================================= */
-#define LORA_SEND_PERIOD_S    180
+/* 720 s = 12 min exactos. Valor OFICIAL, fijado tras comprobar que el nodo en
+   campo venia enviando cada ~727-732 s (medido sobre los uplinks del
+   2026-07-29) mientras el codigo declaraba 180: el binario desplegado no
+   correspondia a ningun commit. 720 cae dentro de la banda medida, deja
+   margen de duty-cycle incluso a SF12 y es el valor que documenta
+   docs/CANALES_Y_TIEMPOS.md. NO cambiar sin subir FW_VERSION. */
+#define LORA_SEND_PERIOD_S    720
 #define SENSOR_READ_PERIOD_S  5
 
 /* =======================================================================
@@ -118,6 +125,18 @@ static void i2c1_scan(void)
 #define FPORT_DATA    2   /* datos periodicos (promedio de la ventana)   */
 #define FPORT_SOS     3   /* boton de emergencia del portal cautivo      */
 #define FPORT_ALERT   4   /* alertas automaticas por umbral (threshold)  */
+#define FPORT_DIAG    5   /* salud del nodo: arranque, causa de reset    */
+
+/* =======================================================================
+ *  IDENTIFICACION DE BUILD   <-- SUBE ESTO EN CADA FIRMWARE QUE FLASHEES
+ * =======================================================================
+ * Se reporta en el uplink de arranque (FPORT_DIAG). Sin esto no hay forma
+ * de saber que codigo corre realmente en un nodo desplegado: el analisis de
+ * los logs del 2026-07-29 demostro que la cadencia en campo (~727-732 s) no
+ * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
+ * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
+ * se flashea, SUBE FW_VERSION. */
+#define FW_VERSION    0x0201   /* v2.1 — anade FPORT_DIAG de arranque */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -167,6 +186,13 @@ static void i2c1_scan(void)
    (multicriterio) IGNORA este cooldown y sale de inmediato. */
 #define ALERT_MIN_INTERVAL_S  60
 
+/* Uplink de arranque (FPORT_DIAG): separacion minima respecto a cualquier otro
+   envio, para no chocar con el duty-cycle (150 s cubre el peor caso a SF12), y
+   tope de intentos para no reintentar indefinidamente si el enlace esta mal
+   (la causa del reset queda igualmente en la consola y en boot_count). */
+#define DIAG_MIN_SPACING_S    150
+#define DIAG_MAX_ATTEMPTS     5
+
 /* =======================================================================
  *  NORMA EN 54-5 — RATE-OF-RISE TERMICO
  * =======================================================================
@@ -200,6 +226,83 @@ static void i2c1_scan(void)
 #define ALERT_HEAT_ROR 0x40   /* subida rapida de temperatura (EN 54-5)        */
 #define ALERT_FIRE     0x80   /* FUEGO confirmado multicriterio (EN 54-30/31)  */
 
+/* =======================================================================
+ *  SALUD DEL NODO: causa de reset + contador de arranques  (FPORT_DIAG)
+ * =======================================================================
+ * Un reinicio hoy es INVISIBLE desde el servidor: el nodo vuelve, hace OTAA,
+ * y el unico rastro es un devAddr nuevo y un fCnt que empieza de cero. Los
+ * logs del 2026-07-29 mostraron dos reinicios en 11 minutos y 10 h de
+ * silencio sin que nada lo señalara.
+ *
+ * hwinfo del ESP32-S3 distingue las causas que separan las hipotesis:
+ *   BROWNOUT   -> caida del rail de alimentacion (panel/bateria/5V)
+ *   CPU_LOCKUP -> panic del kernel (p.ej. stack overflow)
+ *   WATCHDOG   -> perro guardian (aun no hay ninguno configurado: Fase 1)
+ *   POR        -> corte de alimentacion real
+ *   PIN / SW   -> reset externo o provocado por software
+ *
+ * OJO: hwinfo_clear_reset_cause() NO esta implementado en el driver del
+ * ESP32 (zephyr/drivers/hwinfo/hwinfo_esp32.c solo define get_device_id,
+ * get_supported_reset_cause y get_reset_cause). No se llama: esp_reset_reason()
+ * ya latchea el valor correcto de un arranque al siguiente. */
+#define RSTC_UNKNOWN   0
+#define RSTC_POR       1
+#define RSTC_PIN       2
+#define RSTC_SOFTWARE  3
+#define RSTC_WATCHDOG  4
+#define RSTC_LOWPOWER  5
+#define RSTC_LOCKUP    6
+#define RSTC_BROWNOUT  7
+
+static uint8_t reset_cause_code(uint32_t raw)
+{
+    /* Orden por criticidad de diagnostico: brownout y lockup mandan si
+       aparecen combinados con otro bit. */
+    if (raw & RESET_BROWNOUT)       return RSTC_BROWNOUT;
+    if (raw & RESET_CPU_LOCKUP)     return RSTC_LOCKUP;
+    if (raw & RESET_WATCHDOG)       return RSTC_WATCHDOG;
+    if (raw & RESET_POR)            return RSTC_POR;
+    if (raw & RESET_PIN)            return RSTC_PIN;
+    if (raw & RESET_SOFTWARE)       return RSTC_SOFTWARE;
+    if (raw & RESET_LOW_POWER_WAKE) return RSTC_LOWPOWER;
+    return RSTC_UNKNOWN;
+}
+
+static const char *reset_cause_str(uint8_t code)
+{
+    switch (code) {
+    case RSTC_POR:      return "POR (alimentacion)";
+    case RSTC_PIN:      return "PIN (reset externo)";
+    case RSTC_SOFTWARE: return "SOFTWARE";
+    case RSTC_WATCHDOG: return "WATCHDOG";
+    case RSTC_LOWPOWER: return "LOW-POWER WAKE";
+    case RSTC_LOCKUP:   return "CPU LOCKUP (panic)";
+    case RSTC_BROWNOUT: return "BROWNOUT (caida de tension)";
+    default:            return "DESCONOCIDA";
+    }
+}
+
+/* Contador de arranques, persistido en NVS via Settings ("diag/boots").
+   Permite detectar reinicios aunque el uplink de arranque se pierda: si el
+   boot_count del siguiente DIAG salta de N a N+3, hubo 2 reinicios mudos. */
+static uint32_t boot_count;
+
+static int diag_settings_set(const char *name, size_t len,
+                             settings_read_cb read_cb, void *cb_arg)
+{
+    if (settings_name_steq(name, "boots", NULL)) {
+        if (len != sizeof(boot_count)) {
+            return -EINVAL;
+        }
+        return (read_cb(cb_arg, &boot_count, sizeof(boot_count)) < 0)
+               ? -EIO : 0;
+    }
+    return -ENOENT;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(diag, "diag", NULL, diag_settings_set,
+                               NULL, NULL);
+
 static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
 {
@@ -215,6 +318,41 @@ static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
 int main(void)
 {
     printk("BOOT\n");
+
+    /* ---- Salud del nodo: por que hemos arrancado -------------------- */
+    /* Lo PRIMERO, antes de tocar perifericos: es solo una lectura de registro
+       y su valor de diagnostico no debe depender de que el resto arranque. */
+    uint32_t reset_raw = 0;
+    if (hwinfo_get_reset_cause(&reset_raw) < 0) {
+        reset_raw = 0;
+    }
+    const uint8_t reset_code = reset_cause_code(reset_raw);
+    printk("RESET CAUSE: %s (raw=0x%08x)\n", reset_cause_str(reset_code),
+           reset_raw);
+
+    /* Settings/NVS: hay que inicializar el subsistema ANTES de que nadie
+       cargue su subtree. Sin esta llamada, settings_load_subtree() recorre
+       una lista de backends vacia y no hace NADA en silencio (ver
+       zephyr/subsys/settings/src/settings_store.c:41). Eso afectaba tambien
+       a portal_html_init(), que carga "portal" desde portal_start() — es
+       decir, ANTES de lorawan_start(), que era quien acababa inicializando
+       el subsistema: el HTML guardado en NVS nunca se restauraba.
+       Es idempotente, asi que la llamada posterior de lorawan_start() es
+       inocua. */
+    int sret = settings_subsys_init();
+    if (sret < 0) {
+        printk("SETTINGS INIT ERR: %d (contador de arranques no persistira)\n",
+               sret);
+    } else {
+        (void)settings_load_subtree("diag");
+        boot_count++;
+        int wr = settings_save_one("diag/boots", &boot_count,
+                                   sizeof(boot_count));
+        if (wr < 0) {
+            printk("SETTINGS SAVE ERR: %d\n", wr);
+        }
+    }
+    printk("BOOT #%u  FW=0x%04X\n", boot_count, FW_VERSION);
 
     i2c0_scan();
     i2c1_scan();
@@ -410,6 +548,51 @@ int main(void)
         uint16_t voc_x10;
         uint32_t gas_ohm;
     } __packed alert;
+
+    /*
+     * Payload de DIAGNOSTICO de arranque (FPORT_DIAG, 13 bytes, little-endian).
+     * Se envia UNA vez por arranque. Responde a "¿por que ha vuelto a arrancar
+     * este nodo y que firmware lleva?", que hoy no se puede contestar desde el
+     * servidor.
+     *   [0]     uint8  msg_type = 1 (BOOT)
+     *   [1]     uint8  reset_code (0 desconocida, 1 POR, 2 PIN, 3 SW,
+     *                              4 WDT, 5 low-power, 6 CPU lockup, 7 brownout)
+     *   [2-5]   uint32 reset_raw  (mascara cruda de hwinfo, por si hay combinaciones)
+     *   [6-9]   uint32 boot_count (persistente en NVS: detecta reinicios mudos)
+     *   [10-11] uint16 fw_version (FW_VERSION)
+     *   [12]    uint8  sensors_ok (mismos bits que el byte 0 del FPort 2:
+     *                              bit0 BM688, bit1 CO, bit3 SEN65)
+     */
+    struct {
+        uint8_t  msg_type;
+        uint8_t  reset_code;
+        uint32_t reset_raw;
+        uint32_t boot_count;
+        uint16_t fw_version;
+        uint8_t  sensors_ok;
+    } __packed diag = {
+        .msg_type   = 1,
+        .reset_code = reset_code,
+        .reset_raw  = reset_raw,
+        .boot_count = boot_count,
+        .fw_version = FW_VERSION,
+        .sensors_ok = (uint8_t)((bm688_dev  != NULL ? FLAG_BM688_OK : 0) |
+                                (co_dev     != NULL ? FLAG_CO_OK    : 0) |
+                                (sen65_dev  != NULL ? FLAG_SEN65_OK : 0)),
+    };
+
+    /* El DIAG es de MINIMA prioridad: nunca debe robarle airtime al FPort 2
+       ni a una alerta. Va CONFIRMED porque es un evento unico e irrepetible
+       (si se pierde, la causa del reinicio se pierde con el), y por eso
+       'ret == 0' aqui significa ACK recibido, no solo "transmitido". */
+    /* El formato en el aire es un contrato con el decoder de ChirpStack: si
+       el compilador metiese padding, el servidor decodificaria basura sin que
+       nada fallase visiblemente. Que rompa la compilacion, no el diagnostico. */
+    BUILD_ASSERT(sizeof(diag) == 13, "FPORT_DIAG debe ocupar 13 bytes");
+
+    bool    diag_pending  = true;
+    int64_t last_diag_ms  = 0;
+    int     diag_attempts = 0;
 
     /* Snapshot que se publica al portal en cada ciclo (lectura instantanea). */
     struct portal_sensors ps;
@@ -801,6 +984,37 @@ int main(void)
             /* Diagnostico: por que se aplaza la alerta (nunca se pierde). */
             printk("ALERTA aplazada pend=0x%02x (data_due=%d cooldown_ok=%d)\n",
                    alert_pending, (int)data_due, (int)cooldown_ok);
+        }
+
+        /* ---- 3) DIAGNOSTICO DE ARRANQUE (FPort 5) — MINIMA PRIORIDAD -
+         * Sale UNA vez por arranque y solo cuando la radio esta libre: ni
+         * este ciclo tocaba enviar datos, ni hay ninguna alerta pendiente,
+         * y ha pasado DIAG_MIN_SPACING_S desde el ultimo envio de datos y
+         * desde el intento anterior. Asi el instrumento de diagnostico no
+         * puede degradar jamas al canal critico ni a una alarma.
+         */
+        if (diag_pending && !data_due && alert_pending == 0 &&
+            (now - last_send_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000 &&
+            (last_diag_ms == 0 ||
+             (now - last_diag_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000)) {
+
+            last_diag_ms = now;
+            diag_attempts++;
+
+            int dret = lorawan_send(FPORT_DIAG, (uint8_t *)&diag, sizeof(diag),
+                                    LORAWAN_MSG_CONFIRMED);
+            printk("DIAG arranque #%u causa=%s fw=0x%04X -> FPort %d: %d\n",
+                   diag.boot_count, reset_cause_str(diag.reset_code),
+                   FW_VERSION, FPORT_DIAG, dret);
+
+            if (dret == 0) {
+                diag_pending = false;   /* CONFIRMED con ACK: entregado */
+            } else if (diag_attempts >= DIAG_MAX_ATTEMPTS) {
+                printk("DIAG: %d intentos sin ACK, se abandona "
+                       "(boot_count lo reportara el proximo arranque)\n",
+                       diag_attempts);
+                diag_pending = false;
+            }
         }
 
         k_sleep(K_SECONDS(SENSOR_READ_PERIOD_S));

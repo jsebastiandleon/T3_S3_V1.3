@@ -14,15 +14,48 @@ tipo, para que en ChirpStack puedas **enrutar/actuar cada uno por separado**
 | **2** `FPORT_DATA` | uplink | Datos de sensores (promedio), 29 B | cada `LORA_SEND_PERIOD_S` |
 | **3** `FPORT_SOS` | uplink | `"SOS"` (3 B) del botón del portal | al pulsar el botón (≤1 ciclo) |
 | **4** `FPORT_ALERT` | uplink | Alerta por umbral (15 B) | al cruzar un umbral (flanco) |
+| **5** `FPORT_DIAG` | uplink | Salud del nodo (13 B) | una vez por arranque |
 | **10** `PORTAL_HTML_OTA_FPORT` | downlink | Actualización OTA del HTML | cuando mandas el downlink |
 
-Los tres FPort de subida se definen arriba de `main.c`:
+Los FPort de subida se definen arriba de `main.c`:
 
 ```c
 #define FPORT_DATA    2
 #define FPORT_SOS     3
 #define FPORT_ALERT   4
+#define FPORT_DIAG    5
 ```
+
+### FPort 5 — salud del nodo
+
+Existe porque **un reinicio era invisible desde el servidor**: el nodo volvía,
+hacía OTAA y el único rastro era un `devAddr` nuevo y un `fCnt` desde cero. En
+los logs del 2026-07-29 hubo dos reinicios en 11 minutos y 10 h de silencio sin
+que nada lo señalara.
+
+| Campo | Bytes | Contenido |
+|---|---|---|
+| `msg_type` | [0] | 1 = arranque |
+| `reset_code` | [1] | 0 desconocida · 1 POR · 2 PIN · 3 SW · 4 WDT · 5 low-power · **6 CPU lockup** · **7 brownout** |
+| `reset_raw` | [2-5] | máscara cruda de `hwinfo` |
+| `boot_count` | [6-9] | contador persistente en NVS (`diag/boots`) |
+| `fw_version` | [10-11] | `FW_VERSION` de `main.c` |
+| `sensors_ok` | [12] | sensores presentes al arrancar (bit0 BM688, bit1 CO, bit3 SEN65) |
+
+- **`reset_code = 7` (brownout)** → problema de **alimentación** (panel, batería, rail de 5 V).
+- **`reset_code = 6` (CPU lockup)** → **pánico del kernel**, típicamente stack overflow.
+- `boot_count` detecta reinicios **mudos**: si salta de N a N+3, hubo 2 arranques cuyo DIAG no llegó.
+
+Se envía **CONFIRMED** (evento único: si se pierde, la causa se pierde con él) y
+con **prioridad mínima**: sólo sale si en ese ciclo no tocaba enviar datos, no hay
+alerta pendiente y han pasado `DIAG_MIN_SPACING_S` (150 s) desde el último envío.
+Nunca puede robarle airtime al FPort 2 ni a una alarma. Tras
+`DIAG_MAX_ATTEMPTS` (5) intentos sin ACK se abandona.
+
+> **`FW_VERSION` hay que subirlo en cada firmware que se flashee.** Sin eso no se
+> puede saber qué código corre en un nodo desplegado — que es exactamente lo que
+> ocurrió el 2026-07-29, cuando la cadencia en campo (~727-732 s) no correspondía
+> a ningún valor jamás commiteado.
 
 > Para cambiar un canal, hay que editar el `#define` y vuelve a compilar. En ChirpStack no
 > hay que declarar FPorts: el decoder ya distingue 2/3/4 y devuelve el JSON
@@ -52,7 +85,7 @@ reloj, por eso los intervalos se expresan y se cambian en segundos.
 ## 3. Las dos cadencias base
 
 ```c
-#define LORA_SEND_PERIOD_S    729   // cada cuánto se ENVÍA por LoRa (FPort 2)
+#define LORA_SEND_PERIOD_S    720   // cada cuánto se ENVÍA por LoRa (FPort 2)
 #define SENSOR_READ_PERIOD_S  5     // cada cuánto se LEEN los sensores
 ```
 
@@ -81,7 +114,7 @@ while (1) {
 ```
 
 ### Cuántas muestras entran en cada envío
-Nominalmente `LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S`. Con 729/5 ≈ 145
+Nominalmente `LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S`. Con 720/5 = 144
 muestras. En la práctica salen un poco menos porque cada vuelta dura algo
 más de 5 s: al `k_sleep(5 s)` se le suma el tiempo de leer los sensores (heater
 del BM688 ~150 ms, la consulta Q&A del ZE15-CO, la lectura del SEN65). Por eso en

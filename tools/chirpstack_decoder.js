@@ -1,7 +1,8 @@
 /*
  * ChirpStack v4 — Codec (Device Profile > Codec > JavaScript functions).
- * Decoder para el payload v2 (29 bytes, FPort 2) del nodo T3-S3
- * (BM688 + ZE15-CO + SEN65). Ver docs/PAYLOAD_DECODER.md.
+ * Decoder del nodo T3-S3 (BM688 + ZE15-CO + SEN65). Ver docs/PAYLOAD_DECODER.md.
+ *   FPort 2 -> datos v2 (29 B)      FPort 4 -> alerta por umbral (15 B)
+ *   FPort 3 -> SOS (3 B)            FPort 5 -> salud del nodo (13 B)
  *
  * DevEUI de pruebas: 1CDBD4FFFEBD2965
  */
@@ -46,6 +47,41 @@ function decodeUplink(input) {
         pm10_ugm3:          u16(7) / 10,
         voc_index:          u16(9) / 10,
         gas_resistance_ohm: u32(11)
+      }
+    }};
+  }
+
+  // FPort 5 = SALUD DEL NODO. 13 bytes. Hoy solo msg_type 1 (arranque).
+  // Este canal existe para que un reinicio deje de ser invisible: sin el, el
+  // unico rastro de que el nodo se ha reiniciado es un devAddr nuevo.
+  if (input.fPort === 5) {
+    if (b.length < 13) {
+      return { errors: ["diag demasiado corto: " + b.length + " (esperado 13)"] };
+    }
+    if (b[0] !== 1) {
+      return { errors: ["msg_type de diag desconocido: " + b[0]] };
+    }
+    var causes = ["UNKNOWN", "POR", "PIN", "SOFTWARE", "WATCHDOG",
+                  "LOW_POWER_WAKE", "CPU_LOCKUP", "BROWNOUT"];
+    var code = b[1];
+    var fw   = u16(10);
+    var sens = b[12];
+    return { data: {
+      event:       "BOOT",
+      reset_cause: causes[code] || ("INVALID_" + code),
+      reset_code:  code,
+      reset_raw:   u32(2),
+      boot_count:  u32(6),
+      // Alimentacion o software: es la pregunta que este canal resuelve.
+      suspect:     (code === 7) ? "power"
+                 : (code === 6) ? "firmware"
+                 : (code === 4) ? "watchdog"
+                 : "normal",
+      fw_version:  "v" + (fw >> 8) + "." + (fw & 0xFF),
+      sensors_at_boot: {
+        bm688:  (sens & 0x01) !== 0,
+        ze15co: (sens & 0x02) !== 0,
+        sen65:  (sens & 0x08) !== 0
       }
     }};
   }
