@@ -12,6 +12,7 @@ zephyr_linker_sources(SECTIONS sections-rom.ld)
 
 target_sources(app PRIVATE
     src/main.c
+    src/wallclock.c
     src/sensors/bm688.c
     src/sensors/ze15_co.c
     src/sensors/sen6x.c

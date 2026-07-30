@@ -237,6 +237,69 @@ salida del decoder en [`docs/PAYLOAD_DECODER.md`](PAYLOAD_DECODER.md) §2.1.
 
 ---
 
+## 5 bis. Franja nocturna del SoftAP (ahorro de energía)
+
+El SoftAP es el mayor consumidor del nodo: la radio WiFi emite balizas las 24 h.
+En una instalación alimentada por **panel solar** merece la pena apagarlo cuando
+no hay nadie que pueda usar el portal.
+
+```c
+#define AP_OFF_FROM_H   19    // apagado desde las 19:00 (hora LOCAL)
+#define AP_OFF_TO_H      6    // encendido de nuevo a las 06:00
+#define TIME_RESYNC_H   24    // cada cuánto se repide la hora a la red
+```
+
+Para **desactivar** la función y dejar el AP siempre encendido, pon los dos
+valores iguales. La ventana puede cruzar medianoche.
+
+### ¿De dónde sale la hora?
+
+El nodo **no tiene RTC con pila** ni salida a Internet (el SoftAP no enruta). La
+única fuente es el comando MAC **`DeviceTimeReq`** de LoRaWAN:
+
+- Se pide con `lorawan_request_device_time(false)` — el `false` es importante:
+  el comando viaja **piggyback en el siguiente uplink de datos**, así que **no
+  gasta airtime ni duty-cycle propios**. Con `true` forzaría un uplink vacío.
+- `lorawan_device_time_get()` devuelve la **época GPS**; UTC = GPS + 315 964 800.
+  Se ignoran los 18 s de segundos intercalares: irrelevantes frente a una
+  frontera horaria y mantener la tabla no compensa.
+- Entre sincronizaciones el reloj lo mantiene loramac-node. El XTAL del
+  ESP32-S3 deriva ~2 s/día, así que resincronizar cada 24 h sobra de largo.
+
+### Hora local y cambio de hora
+
+`src/wallclock.c` aplica las reglas de la UE (Directiva 2000/84/CE): **UTC+1** en
+invierno y **UTC+2** desde el último domingo de marzo a las 01:00 UTC hasta el
+último domingo de octubre a las 01:00 UTC. Con un offset fijo, la ventana estaría
+desplazada una hora durante siete meses al año.
+
+Los algoritmos de calendario son los de Howard Hinnant (aritmética entera, sin
+tablas ni bucles). **Verificado contra la base de datos tz (`Europe/Madrid`) en
+40 424 instantes** —barrido horario de 4 años, 5 000 instantes aleatorios sobre
+10 años y los bordes exactos de cambio de 2025 a 2030— con **cero discrepancias**.
+
+### Reglas de seguridad
+
+No hay anulación manual, así que las tres reglas importan:
+
+1. **Sin hora, el AP se queda ENCENDIDO.** Nunca se apaga por una suposición: si
+   se apagara sin fundamento, el portal quedaría inaccesible sin forma de
+   recuperarlo salvo reiniciando el nodo físicamente.
+2. **Reintento automático.** `portal_ap_set()` no actualiza su estado interno si
+   el driver falla, y se llama en cada ciclo → una reactivación fallida se
+   reintenta sola. Es el escenario grave: un AP que no vuelve por la mañana.
+3. **Observable desde el servidor.** El bit `0x10` del byte 0 del FPort 2
+   (`status.wifi_ap` en el decoder) indica si la radio estaba encendida. Sirve
+   para confirmar desde ChirpStack que el AP **vuelve** cada mañana. Lo que no
+   es observable no es verificable.
+
+> Sólo se apaga la **radio** del AP. El servidor HTTP, el responder DNS y el
+> servidor DHCP siguen levantados (no consumen sin estaciones asociadas) y no hay
+> que reconstruirlos. Al encender se vuelve a afirmar la IP estática, que es
+> idempotente, para no depender de si el ciclo de bajada del enlace la conservó.
+
+---
+
 ## 6. El límite que manda: duty-cycle EU868 (1 %)
 
 Aunque leas cada 5 s, no se puede transmitir tan seguido. EU868 permite ocupar

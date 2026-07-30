@@ -136,13 +136,18 @@ function decodeUplink(input) {
   var coOk  = (flags & 0x02) !== 0;
   var coFlt = (flags & 0x04) !== 0;
   var senOk = (flags & 0x08) !== 0;
+  var apOn  = (flags & 0x10) !== 0;
 
   var data = {
     status: {
       bm688: bmOk,
       ze15co: coOk,
       ze15co_fault: coFlt,
-      sen65: senOk
+      sen65: senOk,
+      // Radio del SoftAP en el momento del envio. Se apaga en la franja
+      // nocturna para ahorrar energia (nodo solar). Sirve para confirmar que
+      // el AP VUELVE por la mañana, que es el fallo que importa.
+      wifi_ap: apOn
     }
   };
 

@@ -62,9 +62,16 @@ bool portal_take_sos(void)
 /* ---- Arranque ------------------------------------------------------------ */
 static bool started;
 
-static int setup_ap_ip(struct net_if *ap)
+/*
+ * Fija IP/gateway/netmask del AP. Separado del arranque del DHCP porque hay
+ * que repetirlo cada vez que se vuelve a encender la radio: el ap_disable del
+ * driver esp32 baja el enlace y le cambia la MAC al interfaz, y no queremos
+ * depender de si eso conserva o no la direccion. net_if_ipv4_addr_add() busca
+ * primero la direccion existente, asi que repetirlo es inocuo.
+ */
+static int apply_ap_ip(struct net_if *ap)
 {
-	struct in_addr ip, mask, base;
+	struct in_addr ip, mask;
 
 	if (net_addr_pton(AF_INET, AP_IP, &ip) ||
 	    net_addr_pton(AF_INET, AP_NETMASK, &mask)) {
@@ -79,6 +86,21 @@ static int setup_ap_ip(struct net_if *ap)
 	}
 	if (!net_if_ipv4_set_netmask_by_addr(ap, &ip, &mask)) {
 		LOG_ERR("no se pudo fijar netmask del AP");
+	}
+	return 0;
+}
+
+static int setup_ap_ip(struct net_if *ap)
+{
+	struct in_addr ip, base;
+	int ret = apply_ap_ip(ap);
+
+	if (ret) {
+		return ret;
+	}
+
+	if (net_addr_pton(AF_INET, AP_IP, &ip)) {
+		return -EINVAL;
 	}
 
 	/* Pool DHCP a partir de .10 */
@@ -112,6 +134,53 @@ static int enable_softap(struct net_if *ap)
 	return 0;
 }
 
+/* ---- Encendido/apagado de la radio del AP -------------------------------- */
+/* Interfaz cacheada en portal_start(): portal_ap_set() se llama desde el lazo
+   principal y no debe volver a buscarla cada vez. */
+static struct net_if *ap_iface;
+static bool           ap_radio_on;
+
+bool portal_ap_is_on(void)
+{
+	return ap_radio_on;
+}
+
+int portal_ap_set(bool on)
+{
+	if (ap_iface == NULL) {
+		return -ENODEV;
+	}
+	if (on == ap_radio_on) {
+		return 0;   /* idempotente */
+	}
+
+	if (on) {
+		int ret = enable_softap(ap_iface);
+
+		if (ret) {
+			LOG_ERR("no se pudo reactivar el AP: %d", ret);
+			return ret;   /* estado sin tocar: el llamante reintentara */
+		}
+		ret = apply_ap_ip(ap_iface);
+		if (ret) {
+			LOG_ERR("AP activo pero sin IP: %d", ret);
+			return ret;
+		}
+		LOG_INF("SoftAP ENCENDIDO");
+	} else {
+		int ret = net_mgmt(NET_REQUEST_WIFI_AP_DISABLE, ap_iface, NULL, 0);
+
+		if (ret) {
+			LOG_ERR("no se pudo apagar el AP: %d", ret);
+			return ret;
+		}
+		LOG_INF("SoftAP APAGADO (ahorro de energia)");
+	}
+
+	ap_radio_on = on;
+	return 0;
+}
+
 int portal_start(void)
 {
 	if (started) {
@@ -134,6 +203,9 @@ int portal_start(void)
 	if (ret) {
 		return ret;
 	}
+	ap_iface    = ap;
+	ap_radio_on = true;
+
 	ret = setup_ap_ip(ap);
 	if (ret) {
 		return ret;

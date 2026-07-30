@@ -45,6 +45,27 @@ struct portal_sensors {
 /* Arranca AP + DHCP + DNS cautivo + HTTP. Idempotente. 0 = OK. */
 int portal_start(void);
 
+/* ---- Encendido/apagado del SoftAP -------------------------------------- */
+/*
+ * El SoftAP es, con diferencia, el mayor consumidor del nodo (radio WiFi
+ * siempre emitiendo balizas). En una instalacion alimentada por panel solar
+ * merece la pena apagarlo cuando no hay nadie que pueda usar el portal.
+ *
+ * portal_ap_set() apaga/enciende SOLO la radio del AP: el servidor HTTP, el
+ * responder DNS y el servidor DHCP siguen levantados (no consumen si no hay
+ * estaciones asociadas) y no hay que reconstruirlos. Al encender se vuelve a
+ * afirmar la IP estatica, que es idempotente, para no depender de si el ciclo
+ * de bajada del enlace la conservo.
+ *
+ * Es idempotente: llamarla con el estado actual no hace nada y devuelve 0.
+ * Devuelve <0 si el driver rechaza el cambio; en ese caso el estado interno
+ * NO cambia, para que el llamante pueda reintentar.
+ */
+int  portal_ap_set(bool on);
+
+/* Estado actual de la radio del AP. */
+bool portal_ap_is_on(void);
+
 /* Publica nuevas lecturas (thread-safe) para /api/sensors. */
 void portal_update_sensors(const struct portal_sensors *s);
 

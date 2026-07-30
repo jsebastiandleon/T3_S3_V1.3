@@ -10,6 +10,7 @@
 #include "sensors/ze15_co.h"
 #include "sensors/sen6x.h"
 #include "portal/portal.h"
+#include "wallclock.h"
 
 /* Escaner de diagnostico del bus I2C0: lista las direcciones que hacen ACK.
    Util para verificar si el bus esta electricamente vivo (pull-ups OK) y
@@ -76,6 +77,11 @@ static void i2c1_scan(void)
 #define FLAG_CO_OK     0x02
 #define FLAG_CO_FAULT  0x04
 #define FLAG_SEN65_OK  0x08
+/* Estado de la radio del SoftAP en el momento del envio. Sin este bit, la
+   franja nocturna seria invisible desde el servidor: no habria forma de saber
+   si el AP se apago cuando debia, ni —lo que importa de verdad— si volvio a
+   encenderse por la mañana. Lo que no es observable no es verificable. */
+#define FLAG_AP_ON     0x10
 
 /* =======================================================================
  *  CONFIGURACION DE TIEMPOS  <-- CAMBIA AQUI EL INTERVALO DE ENVIO
@@ -136,7 +142,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0202   /* v2.2 — señal de fallo de sensor (FPORT_DIAG) */
+#define FW_VERSION    0x0203   /* v2.3 — franja nocturna del SoftAP (hora LoRaWAN) */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -206,6 +212,32 @@ static void i2c1_scan(void)
  *   queda pendiente y se reintenta sin coste de airtime. */
 #define FAULT_CONSEC_FAILS    3
 #define FAULT_MIN_SPACING_S   30
+
+/* =======================================================================
+ *  FRANJA NOCTURNA DEL SOFTAP   <-- CAMBIA AQUI EL HORARIO
+ * =======================================================================
+ * El SoftAP es el mayor consumidor del nodo (radio WiFi emitiendo balizas
+ * las 24 h). En una instalacion solar merece la pena apagarlo cuando no hay
+ * nadie que pueda usar el portal.
+ *
+ * La franja se expresa en HORA LOCAL (peninsula: UTC+1 / UTC+2 en verano; el
+ * cambio se aplica solo, ver src/wallclock.c). El AP esta APAGADO desde
+ * AP_OFF_FROM_H:00 hasta AP_OFF_TO_H:00. La ventana puede cruzar medianoche.
+ *   19 -> 6  = apagado de 19:00 a 05:59, encendido a las 06:00.
+ * Para DESACTIVAR la funcion y dejar el AP siempre encendido, pon los dos
+ * valores iguales.
+ *
+ * SEGURIDAD: no hay anulacion manual. Si el nodo no tiene la hora, el AP se
+ * queda ENCENDIDO — nunca se apaga por una suposicion. Ver AP_SCHED_* abajo.
+ * ======================================================================= */
+#define AP_OFF_FROM_H   19
+#define AP_OFF_TO_H     6
+
+/* Cada cuanto se vuelve a pedir la hora a la red (DeviceTimeReq). La peticion
+   viaja PIGGYBACK en el siguiente uplink de datos, no gasta airtime propio.
+   El XTAL del ESP32-S3 deriva ~2 s/dia, asi que resincronizar a diario sobra
+   de largo para una frontera horaria. */
+#define TIME_RESYNC_H   24
 
 /* =======================================================================
  *  NORMA EN 54-5 — RATE-OF-RISE TERMICO
@@ -346,6 +378,22 @@ static void health_update(struct sensor_health *h, bool ok, uint8_t bit,
         printk("SALUD: sensor 0x%02x EN FALLO (%u lecturas seguidas)\n",
                bit, (unsigned int)h->consec_fails);
     }
+}
+
+/*
+ * ¿Cae 'hour' (hora local) dentro de la franja en la que el AP debe estar
+ * apagado? La ventana puede cruzar medianoche (19 -> 6). Si los dos extremos
+ * son iguales, la funcion queda desactivada y el AP no se apaga nunca.
+ */
+static bool ap_in_off_window(uint8_t hour)
+{
+	if (AP_OFF_FROM_H == AP_OFF_TO_H) {
+		return false;
+	}
+	if (AP_OFF_FROM_H < AP_OFF_TO_H) {
+		return hour >= AP_OFF_FROM_H && hour < AP_OFF_TO_H;
+	}
+	return hour >= AP_OFF_FROM_H || hour < AP_OFF_TO_H;
 }
 
 /* Contador de arranques, persistido en NVS via Settings ("diag/boots").
@@ -730,6 +778,11 @@ int main(void)
     uint8_t fault_up_pending   = 0;   /* FALLO-> OK    */
     int64_t last_fault_ms      = 0;
 
+    /* Hora de red (DeviceTimeReq) para la franja nocturna del SoftAP. La
+       peticion viaja PIGGYBACK en el siguiente uplink, no gasta airtime. */
+    int64_t last_time_req_ms = 0;
+    bool    time_ever_synced = false;
+
     /* Supervision del enlace: cuenta de envios de datos (para el keepalive) y
        de keepalives consecutivos sin ACK (para disparar el rejoin). */
     uint32_t data_send_count = 0;
@@ -852,6 +905,46 @@ int main(void)
         portal_update_sensors(&ps);
 
         int64_t now = k_uptime_get();
+
+        /* ---- Hora de red y franja nocturna del SoftAP ------------------
+         * La unica fuente de hora del nodo es el DeviceTimeReq de LoRaWAN
+         * (no hay RTC con pila, y el SoftAP no da salida a Internet). Se pide
+         * con force_request=false: el comando MAC viaja piggyback en el
+         * siguiente uplink de datos, sin gastar airtime ni duty-cycle propios.
+         */
+        if (last_time_req_ms == 0 ||
+            (now - last_time_req_ms) >= (int64_t)TIME_RESYNC_H * 3600 * 1000) {
+            int tr = lorawan_request_device_time(false);
+            if (tr < 0) {
+                printk("DeviceTimeReq err: %d\n", tr);
+            }
+            last_time_req_ms = now;
+        }
+
+        uint32_t gps_now = 0;
+        struct wallclock_tm lt;
+        bool have_time = (lorawan_device_time_get(&gps_now) == 0) &&
+                         wallclock_from_gps(gps_now, &lt);
+
+        if (have_time && !time_ever_synced) {
+            time_ever_synced = true;
+            printk("HORA de red: %04d-%02u-%02u %02u:%02u local (%s)\n",
+                   lt.year, lt.month, lt.day, lt.hour, lt.min,
+                   lt.dst ? "verano UTC+2" : "invierno UTC+1");
+        }
+
+        /*
+         * FAIL-SAFE: sin hora fiable, el AP se queda ENCENDIDO. No hay
+         * anulacion manual, asi que apagarlo por una suposicion dejaria el
+         * portal inaccesible sin forma de recuperarlo salvo reiniciando el
+         * nodo fisicamente. El fallo debe caer del lado de la disponibilidad.
+         *
+         * portal_ap_set() es idempotente y NO actualiza su estado interno si
+         * el driver falla, asi que llamarla en cada ciclo reintenta sola una
+         * reactivacion fallida — que es el escenario grave (AP que no vuelve).
+         */
+        bool ap_should_be_on = !have_time || !ap_in_off_window(lt.hour);
+        (void)portal_ap_set(ap_should_be_on);
 
         /* Rate-of-rise termico (EN 54-5): mete (now, temp) en la ventana
            deslizante y calcula el ritmo en C/min entre la muestra mas antigua
@@ -1005,6 +1098,9 @@ int main(void)
             }
             if (acc.co_fault_seen) {
                 payload.flags |= FLAG_CO_FAULT;
+            }
+            if (portal_ap_is_on()) {
+                payload.flags |= FLAG_AP_ON;
             }
             if (acc.sen_n > 0) {
                 payload.pm1_0_x10     = (uint16_t)((acc.pm1_sum  / acc.sen_n) * 10.0);
