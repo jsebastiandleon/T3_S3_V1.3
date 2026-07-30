@@ -142,7 +142,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0203   /* v2.3 — franja nocturna del SoftAP (hora LoRaWAN) */
+#define FW_VERSION    0x0204   /* v2.4 — el CO se recupera solo (backoff) */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -212,6 +212,25 @@ static void i2c1_scan(void)
  *   queda pendiente y se reintenta sin coste de airtime. */
 #define FAULT_CONSEC_FAILS    3
 #define FAULT_MIN_SPACING_S   30
+
+/* =======================================================================
+ *  REINTENTO DEL ZE15-CO TRAS UN FALLO PERSISTENTE
+ * =======================================================================
+ * Cada lectura fallida del CO cuesta hasta 4.5 s de lazo (3 intentos x 1500
+ * ms de timeout), y ese es tiempo que el nodo NO dedica a detectar. Por eso,
+ * tras FAULT_CONSEC_FAILS fallos seguidos, se PAUSA la lectura.
+ *
+ * Pero se pausa, no se abandona. El driver documenta fallos transitorios
+ * (desbordamiento del FIFO RX, el sensor abortando una trama al conmutar
+ * entre Q&A y upload — ver src/sensors/ze15_co.c); un glitch de ~20 s no
+ * puede costar el criterio de CO durante semanas en un detector de incendios.
+ *
+ * La pausa crece exponencialmente (60 s, 120, 240... hasta CO_RETRY_MAX_S) y
+ * vuelve al minimo en cuanto hay una lectura buena. Con el tope de 15 min, un
+ * sensor realmente ausente cuesta 4.5 s de cada 900 = 0.5% del tiempo de lazo.
+ * ======================================================================= */
+#define CO_RETRY_MIN_S        60
+#define CO_RETRY_MAX_S        900
 
 /* =======================================================================
  *  FRANJA NOCTURNA DEL SOFTAP   <-- CAMBIA AQUI EL HORARIO
@@ -778,6 +797,11 @@ int main(void)
     uint8_t fault_up_pending   = 0;   /* FALLO-> OK    */
     int64_t last_fault_ms      = 0;
 
+    /* Pausa con backoff del ZE15-CO. 'co_retry_at_ms' = instante a partir del
+       cual se vuelve a intentar leer; 0 = leer ya. */
+    int64_t  co_retry_at_ms = 0;
+    uint32_t co_backoff_s   = CO_RETRY_MIN_S;
+
     /* Hora de red (DeviceTimeReq) para la franja nocturna del SoftAP. La
        peticion viaja PIGGYBACK en el siguiente uplink, no gasta airtime. */
     int64_t last_time_req_ms = 0;
@@ -804,6 +828,12 @@ int main(void)
     int     ror_count = 0;
 
     while (1) {
+        /* Marca de tiempo del INICIO del ciclo. Hace falta aparte de 'now'
+           (que se toma mas abajo, DESPUES de leer los sensores) porque las
+           lecturas pueden tardar varios segundos y la pausa del CO hay que
+           evaluarla antes de decidir si se lee. */
+        const int64_t cycle_start_ms = k_uptime_get();
+
         /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
            en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
         if (portal_take_sos()) {
@@ -840,9 +870,10 @@ int main(void)
         }
 
         /* ZE15-CO (si esta presente) -> fluye al portal aunque falte el BM688.
-           Si falla 3 veces seguidas (p.ej. sin sensor) se deja de leer para no
-           inundar el log ni bloquear el lazo ~4.5 s por ciclo. */
-        if (co_dev != NULL) {
+           Tras FAULT_CONSEC_FAILS fallos seguidos la lectura se PAUSA con
+           backoff exponencial (ver CO_RETRY_* arriba), nunca se abandona: el
+           criterio de CO tiene que poder volver solo. */
+        if (co_dev != NULL && cycle_start_ms >= co_retry_at_ms) {
             struct ze15co_data cd;
             int cr = ze15co_read(co_dev, &cd);
             bool co_ok = (cr == 0 && !cd.sensor_fault);
@@ -852,21 +883,20 @@ int main(void)
                 acc.co_n++;
                 ps.co_valid = true;
                 ps.co_ppm   = cd.co_ppm;
+                co_backoff_s = CO_RETRY_MIN_S;   /* sano: reintento rapido otra vez */
             } else if (cr == 0 && cd.sensor_fault) {
                 acc.co_fault_seen = true;  /* sensor reporta fallo interno */
             }
             health_update(&h_co, co_ok, FLAG_CO_OK,
                           &fault_down_pending, &fault_up_pending);
 
-            /* PENDIENTE (Fase 1, paso siguiente): esta deshabilitacion es
-               IRREVERSIBLE — sin reintento no hay forma de recuperar el CO sin
-               reiniciar el nodo. De momento, al menos ya no es muda: el
-               health_update() de arriba ha marcado la transicion y el reporte
-               sale por FPORT_DIAG. */
-            if (h_co.consec_fails >= FAULT_CONSEC_FAILS) {
-                printk("ZE15-CO: %u fallos seguidos, se deshabilita la lectura\n",
-                       (unsigned int)h_co.consec_fails);
-                co_dev = NULL;
+            if (!co_ok && h_co.consec_fails >= FAULT_CONSEC_FAILS) {
+                co_retry_at_ms = k_uptime_get() + (int64_t)co_backoff_s * 1000;
+                printk("ZE15-CO: %u fallos seguidos, pausa de %u s "
+                       "(se reintentara solo)\n",
+                       (unsigned int)h_co.consec_fails,
+                       (unsigned int)co_backoff_s);
+                co_backoff_s = MIN(co_backoff_s * 2U, (uint32_t)CO_RETRY_MAX_S);
             }
         }
 

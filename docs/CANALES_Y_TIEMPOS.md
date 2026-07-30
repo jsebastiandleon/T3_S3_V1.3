@@ -92,6 +92,33 @@ degradado en silencio, que es justo el defecto que este canal elimina.
 Los contadores acumulados distinguen una avería **intermitente** (contador que
 crece sin que el sensor llegue a caer) de una **dura** (cae y no vuelve).
 
+#### El ZE15-CO se pausa, no se abandona
+
+Cada lectura fallida del CO cuesta hasta **4,5 s de lazo** (3 intentos × 1500 ms
+de timeout), y ése es tiempo en que el nodo no lee ningún sensor. Por eso tras 3
+fallos seguidos la lectura se **pausa**. Pero se pausa con reintento
+automático — nunca se abandona:
+
+```c
+#define CO_RETRY_MIN_S   60     // primera pausa
+#define CO_RETRY_MAX_S   900    // tope (15 min)
+```
+
+La pausa dobla en cada fallo (60 → 120 → 240 → 480 → 900 → 900…) y **vuelve al
+mínimo en cuanto hay una lectura buena**. El driver documenta fallos transitorios
+(desbordamiento del FIFO RX, el sensor abortando una trama al conmutar entre Q&A
+y upload — `src/sensors/ze15_co.c:37-41` y `:95-104`); un glitch de 15-30 s no
+puede costar el criterio de CO durante semanas en un detector de incendios.
+
+Coste medido en simulación con un sensor **permanentemente ausente**: 9 lecturas
+en una hora en vez de ~650, y **1,1 % del tiempo de lazo** perdido. Con el tope
+de 15 min alcanzado, 4,5 s de cada 900 = 0,5 %.
+
+> **Al probarlo en banco:** tras reconectar el sensor, la recuperación tarda lo
+> que quede de la pausa en curso. Si desconectas y reconectas pronto la espera es
+> de 1-2 min; si lo dejas fallando mucho rato, el backoff habrá llegado al tope y
+> puede tardar hasta 15. No es que no funcione: está esperando.
+
 > En el SCADA, `degraded: true` del decoder debe generar aviso: significa que el
 > nodo está detectando con menos criterios de los que debería.
 
