@@ -19,8 +19,16 @@
 
 LOG_MODULE_REGISTER(portal_html, LOG_LEVEL_INF);
 
-/* Dashboard: tarjetas por sensor + indicadores de estado + mini-graficos SVG
- * (sparklines) dibujados en el cliente con la historia de las ultimas lecturas.
+/* Dashboard: tarjetas por sensor + indicadores de estado + barras de nivel
+ * con zonas de umbral (verde/ambar/rojo) para las magnitudes criticas.
+ *
+ * Por que barras y no sparklines: el nodo NO guarda historico, la serie solo
+ * existia en la memoria del navegador desde que se abria la pagina, asi que
+ * la grafica no representaba nada util (arrancaba vacia en cada visita y se
+ * perdia al recargar). La barra con umbrales SI da contexto a una lectura
+ * instantanea: donde cae el valor respecto a los limites de referencia.
+ * (La version con sparklines SVG queda en el historial de git.)
+ *
  * 100% autocontenido (sin imagenes ni librerias externas) -> rinde en el
  * navegador cautivo de iOS/Android sin acceso a internet. */
 static const char default_html[] =
@@ -31,11 +39,14 @@ static const char default_html[] =
 	"background:#0f172a;color:#e2e8f0}header{padding:14px;text-align:center}"
 	"h1{margin:0;font-size:20px}.sub{color:#94a3b8;font-size:12px;margin-top:4px}"
 	".wrap{max-width:520px;margin:0 auto;padding:0 12px 24px}"
+	/* --- SOS DESACTIVADO: estilos del boton, se conservan para reactivarlo ---
 	".sos{display:block;width:100%;padding:16px;margin:6px 0 16px;border:0;"
 	"border-radius:12px;background:#dc2626;color:#fff;font-size:18px;"
 	"font-weight:700}.sos:active{background:#991b1b}"
 	".sos.arm{background:#f59e0b;color:#111}"
+	   --- fin estilos SOS --- */
 	".card{background:#1e293b;border-radius:12px;padding:12px 14px;margin:10px 0}"
+	".card:first-child{margin-top:16px}"
 	".card h2{margin:0 0 8px;font-size:15px;color:#38bdf8;display:flex;"
 	"align-items:center;gap:8px}.dot{width:10px;height:10px;border-radius:50%;"
 	"background:#475569;display:inline-block}.dot.on{background:#22c55e}"
@@ -43,20 +54,42 @@ static const char default_html[] =
 	"gap:4px 14px}.kv{display:flex;justify-content:space-between;font-size:14px;"
 	"padding:2px 0}.kv b{font-variant-numeric:tabular-nums}.kv u{color:#94a3b8;"
 	"font-weight:400;font-size:11px;text-decoration:none;margin-left:3px}"
-	".lbl{font-size:11px;color:#94a3b8;margin-top:10px}.spark{width:100%;"
-	"height:auto;margin-top:4px;background:#0b1220;border-radius:6px;display:block}"
+	/* Barra de nivel: la pista es el degradado de zonas (los cortes en % son
+	 * los umbrales sobre el fondo de escala) y el cursor marca el valor. */
+	".lbl{font-size:11px;color:#94a3b8;margin-top:12px;display:flex;"
+	"justify-content:space-between;align-items:center;gap:8px}"
+	".tag{font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;"
+	"background:#334155;color:#e2e8f0;white-space:nowrap}"
+	".bar{position:relative;height:9px;border-radius:5px;margin-top:5px}"
+	".bar.off{filter:grayscale(1);opacity:.35}"
+	".bar i{position:absolute;top:-4px;left:0;margin-left:-2px;width:4px;"
+	"height:17px;border-radius:2px;background:#f8fafc;"
+	"box-shadow:0 0 0 1.5px #0f172a;transition:left .4s}"
+	".bt{background:linear-gradient(90deg,#22c55e 0 58%,#f59e0b 58% 75%,#ef4444 75%)}"
+	/* CO a fondo de escala 150 ppm: 9->6%, 35->23%, 100->67%. */
+	".bc{background:linear-gradient(90deg,#22c55e 0 6%,#f59e0b 6% 23%,"
+	"#ef4444 23% 67%,#a855f7 67%)}"
+	".bp{background:linear-gradient(90deg,#22c55e 0 12%,#f59e0b 12% 35%,"
+	"#ef4444 35% 55%,#a855f7 55%)}"
+	".sc{display:flex;justify-content:space-between;font-size:10px;"
+	"color:#64748b;margin-top:3px}.sc b{color:#cbd5e1;font-weight:600;"
+	"font-variant-numeric:tabular-nums}"
 	"footer{text-align:center;color:#94a3b8;font-size:11px;padding:12px 8px;"
 	"line-height:1.5}footer b{color:#cbd5e1}</style></head><body>"
 	"<header><h1>Gandia WildFire</h1><div class=\"sub\" id=\"age\">cargando...</div></header>"
 	"<div class=\"wrap\">"
+	/* --- SOS DESACTIVADO: descomentar esta linea para volver a mostrarlo ---
 	"<button class=\"sos\" id=\"sos\">ENVIAR SOS</button>"
+	   --- fin markup SOS --- */
 	"<div class=\"card\"><h2><span class=\"dot\" id=\"da\"></span>Ambiente</h2>"
 	"<div class=\"grid\">"
 	"<div class=\"kv\"><span>Temperatura</span><b><span id=\"t\">--</span> &deg;C</b></div>"
 	"<div class=\"kv\"><span>Humedad</span><b><span id=\"h\">--</span> %</b></div>"
 	"<div class=\"kv\"><span>Presi&oacute;n</span><b><span id=\"p\">--</span> hPa</b></div></div>"
-	"<div class=\"lbl\">Temperatura &middot; &deg;C</div>"
-	"<svg class=\"spark\" id=\"spt\" viewBox=\"0 0 260 56\"></svg></div>"
+	"<div class=\"lbl\"><span>Temperatura</span><span class=\"tag\" id=\"qt\">--</span></div>"
+	"<div class=\"bar bt\" id=\"gt\"><i></i></div>"
+	"<div class=\"sc\"><span>0</span><span>aviso 35</span><span>riesgo 45</span>"
+	"<span><b id=\"vt\">--</b> &deg;C</span></div></div>"
 	"<div class=\"card\"><h2><span class=\"dot\" id=\"dq\"></span>Calidad del aire</h2>"
 	"<div class=\"grid\">"
 	"<div class=\"kv\"><span>Mon&oacute;xido CO</span><b><span id=\"co\">--</span> ppm</b></div>"
@@ -66,33 +99,56 @@ static const char default_html[] =
 	"<div class=\"kv\"><span>PM4.0</span><b><span id=\"pm4\">--</span> <u>&micro;g/m&sup3;</u></b></div>"
 	"<div class=\"kv\"><span>COV</span><b><span id=\"voc\">--</span> <u>&iacute;ndice</u></b></div>"
 	"<div class=\"kv\"><span>NOx</span><b><span id=\"nox\">--</span> <u>&iacute;ndice</u></b></div>"
-	"<div class=\"kv\"><span>Gas</span><b><span id=\"g\">--</span> &Omega;</b></div></div>"
-	"<div class=\"lbl\">Mon&oacute;xido CO &middot; ppm</div>"
-	"<svg class=\"spark\" id=\"spco\" viewBox=\"0 0 260 56\"></svg>"
-	"<div class=\"lbl\">PM2.5 &middot; &micro;g/m&sup3;</div>"
-	"<svg class=\"spark\" id=\"sppm\" viewBox=\"0 0 260 56\"></svg></div>"
-	"</div><footer>Dise&ntilde;ado por <b>Gesinen</b> &middot; Hecho en Espa&ntilde;a<br>"
+	/* El BM688 entrega OHMIOS de un MOX: un numero que no significa nada
+	 * para quien abre el portal. Se muestra traducido (ver GS() abajo):
+	 * palabra + indice 0-100, sin unidad electrica. */
+	"<div class=\"kv\"><span>Gases</span><b><span id=\"g\">--</span></b></div></div>"
+	"<div class=\"lbl\"><span>Mon&oacute;xido CO</span><span class=\"tag\" id=\"qc\">--</span></div>"
+	"<div class=\"bar bc\" id=\"gc\"><i></i></div>"
+	"<div class=\"sc\"><span>0</span><span>9</span><span>35</span><span>100</span>"
+	"<span><b id=\"vc\">--</b> ppm</span></div>"
+	"<div class=\"lbl\"><span>PM2.5</span><span class=\"tag\" id=\"qp\">--</span></div>"
+	"<div class=\"bar bp\" id=\"gp\"><i></i></div>"
+	"<div class=\"sc\"><span>0</span><span>12</span><span>35</span><span>55</span>"
+	"<span><b id=\"vp\">--</b> &micro;g/m&sup3;</span></div></div>"
+	"</div><footer>Lectura instant&aacute;nea &middot; el nodo no guarda hist&oacute;rico<br>"
+	"Dise&ntilde;ado por <b>Gesinen</b> &middot; Hecho en Espa&ntilde;a<br>"
 	"Portal cautivo &middot; http://192.168.4.1</footer>"
 	"<script>"
-	"var H={t:[],co:[],pm:[]};"
 	"function $(i){return document.getElementById(i);}"
 	"function S(i,v){$(i).textContent=v;}"
 	"function D(i,o){$(i).className='dot'+(o?' on':' err');}"
-	"function P(a,v){a.push(v);if(a.length>40)a.shift();}"
-	/* Sparkline con escala: ejes min/max, rejilla y valor actual. */
-	"function C(id,a,c){var e=$(id),n=a.length;if(!n){e.innerHTML='';return;}"
-	"var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);"
-	"if(mx-mn<1e-6){mx=mn+1;mn=mn-1;}var r=mx-mn;"
-	"var x0=40,x1=256,y0=6,y1=46,W=x1-x0,Hh=y1-y0,p='';"
-	"for(var i=0;i<n;i++){var x=x0+i*(W/((n-1)||1)),y=y1-((a[i]-mn)/r)*Hh;"
-	"p+=x.toFixed(1)+','+y.toFixed(1)+' ';}"
-	"var g='<line x1='+x0+' y1='+y0+' x2='+x1+' y2='+y0+' stroke=\"#334155\"/>';"
-	"g+='<line x1='+x0+' y1='+y1+' x2='+x1+' y2='+y1+' stroke=\"#334155\"/>';"
-	"g+='<text x=2 y='+(y0+4)+' fill=\"#94a3b8\" font-size=9>'+mx.toFixed(1)+'</text>';"
-	"g+='<text x=2 y='+y1+' fill=\"#94a3b8\" font-size=9>'+mn.toFixed(1)+'</text>';"
-	"g+='<polyline fill=\"none\" stroke=\"'+c+'\" stroke-width=2 points=\"'+p+'\"/>';"
-	"g+='<text x='+x1+' y=54 fill=\"'+c+'\" font-size=9 text-anchor=\"end\">'+a[n-1].toFixed(1)+'</text>';"
-	"e.innerHTML=g;}"
+	/* Colores de zona, en el mismo orden que los umbrales de cada barra. */
+	"var Q=['#22c55e','#f59e0b','#ef4444','#a855f7'];"
+	"var NT=['Normal','Aviso','Riesgo'];"
+	"var NC=['Bueno','Moderado','Alto','Peligroso'];"
+	"var NP=['Bueno','Moderado','Malo','Muy malo'];"
+	"var NG=['Limpio','Regular','Malo','Muy malo'];"
+	/* GS(): la resistencia del MOX sube con aire limpio y baja cuando hay
+	 * gases/COV, de forma LOGARITMICA. Se mapea el rango 5 kOhm (saturado)
+	 * a 500 kOhm (limpio) sobre un indice 0-100 y se acompana de una
+	 * palabra, para no ensenar ohmios a quien no le dicen nada. Es una
+	 * escala ORIENTATIVA: el MOX no esta calibrado y deriva, por eso el
+	 * firmware no lo usa para alertas (TH_GAS_EN=0). Si tu unidad se queda
+	 * siempre en la misma palabra, ajusta LO/HI a lo que de en reposo. */
+	"function GS(r){var e=$('g');"
+	"if(!r||r<=0){e.textContent='--';e.style.color='';return;}"
+	"var LO=Math.log(5000),HI=Math.log(500000);"
+	"var v=Math.round(100*(Math.log(r)-LO)/(HI-LO));"
+	"v=Math.max(0,Math.min(100,v));"
+	"var k=v>=70?0:(v>=40?1:(v>=20?2:3));"
+	"e.textContent=NG[k]+' ('+v+')';e.style.color=Q[k];}"
+	/* G(barra,etiqueta,valor,valor_texto,fondo_escala,umbrales,nombres):
+	 * coloca el cursor en la pista y clasifica la lectura por umbrales.
+	 * Sin dato -> barra en gris y etiqueta '--'. */
+	"function G(id,tg,v,vt,mx,th,nm){var e=$(id),k=(v==null||isNaN(v));"
+	"e.classList.toggle('off',k);"
+	"e.firstChild.style.left=(k?0:Math.max(0,Math.min(100,v/mx*100)))+'%';"
+	"var t=$(tg);S(vt,k?'--':v.toFixed(1));"
+	"if(k){t.textContent='--';t.style.background='#334155';"
+	"t.style.color='#e2e8f0';return;}"
+	"var i=0;while(i<th.length&&v>=th[i])i++;"
+	"t.textContent=nm[i];t.style.background=Q[i];t.style.color='#0f172a';}"
 	"async function u(){try{var d=await(await fetch('/api/sensors')).json();"
 	/* Unifica temp/humedad: BM688 preferente, si no SEN65. */
 	"var tm=d.bm688?d.temperature:(d.sen65?d.s_temp:null);"
@@ -101,18 +157,21 @@ static const char default_html[] =
 	"S('t',tm!=null?tm.toFixed(1):'--');"
 	"S('h',hm!=null?hm.toFixed(1):'--');"
 	"S('p',d.bm688?(d.pressure/100).toFixed(1):'--');"
-	"S('g',d.bm688?d.gas:'--');"
+	"GS(d.bm688?d.gas:null);"
 	"S('co',d.co?d.co_ppm.toFixed(1):'--');"
 	"S('pm25',d.sen65?d.pm2_5.toFixed(1):'--');"
 	"S('pm10',d.sen65?d.pm10_0.toFixed(1):'--');"
 	"S('pm1',d.sen65?d.pm1_0.toFixed(1):'--');"
 	"S('pm4',d.sen65?d.pm4_0.toFixed(1):'--');"
 	"S('voc',d.sen65?d.voc:'--');S('nox',d.sen65?d.nox:'--');"
-	"if(tm!=null)P(H.t,tm);if(d.co)P(H.co,d.co_ppm);"
-	"if(d.sen65)P(H.pm,d.pm2_5);"
-	"C('spt',H.t,'#f59e0b');C('spco',H.co,'#ef4444');C('sppm',H.pm,'#38bdf8');"
+	"G('gt','qt',tm,'vt',60,[35,45],NT);"
+	"G('gc','qc',d.co?d.co_ppm:null,'vc',150,[9,35,100],NC);"
+	"G('gp','qp',d.sen65?d.pm2_5:null,'vp',100,[12,35,55],NP);"
 	"S('age',d.age_ms<0?'sin lecturas a\\u00fan':'actualizado hace '+(d.age_ms/1000).toFixed(0)+' s');"
 	"}catch(e){S('age','sin datos');}}"
+	/* --- SOS DESACTIVADO: logica de armado + envio a /api/sos (el endpoint
+	 *     sigue vivo en el firmware). Descomentar junto al markup y los
+	 *     estilos de arriba para reactivar el boton. ---
 	"var armed=false,at;"
 	"$('sos').onclick=function(){var b=this;"
 	"if(!armed){armed=true;b.classList.add('arm');"
@@ -124,8 +183,10 @@ static const char default_html[] =
 	"fetch('/api/sos').then(function(){b.textContent='SOS ENVIADO';})"
 	".catch(function(){b.textContent='Error, reintenta';});"
 	"setTimeout(function(){b.textContent='ENVIAR SOS';},4000);};"
+	   --- fin logica SOS --- */
 	"u();setInterval(u,2000);"
 	"</script></body></html>";
+
 
 /* No desbordar los buffers (vivo + staging) al cargar el default. */
 BUILD_ASSERT(sizeof(default_html) <= PORTAL_HTML_MAX,
