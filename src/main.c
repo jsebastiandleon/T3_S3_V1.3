@@ -142,7 +142,68 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0203   /* v2.3 — franja nocturna del SoftAP (hora LoRaWAN) */
+#define FW_VERSION    0x0204   /* v2.4 — compensacion de offset de temperatura */
+
+/* =======================================================================
+ *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
+ * =======================================================================
+ * Los dos sensores de temperatura leen SU PROPIO DIE, no el aire, y ambos se
+ * autocalientan:
+ *   - BM688: la placa MOX del canal de gas sube a ~320 C en cada ciclo, en el
+ *     mismo encapsulado que el termometro -> sesgo POSITIVO tipico.
+ *   - SEN65: lleva ventilador y laser dentro del modulo.
+ * A eso se suma el calor de la caja (ESP32 haciendo de SoftAP + SX1262
+ * transmitiendo) y, en exterior, la radiacion solar sobre el alojamiento.
+ * Resultado: la exactitud real en campo (varios C) la domina el MONTAJE, no la
+ * del datasheet.
+ *
+ * Cifras EXACTAS de las hojas de datos (no de memoria):
+ *   - BM688, BST-BME688-DS000-03 Rev 1.3 (02/2024), Tabla 10: exactitud
+ *     absoluta de temperatura +-0.5 C en 0-65 C. Su nota 19 dice literalmente
+ *     que el valor "depends on the PCB temperature, sensor element
+ *     self-heating and ambient temperature and is typically above ambient
+ *     temperature" -> el propio Bosch avisa de que lee POR ENCIMA del ambiente.
+ *   - SEN65, SEN6x DS v0.91 (08/2025), Tabla 3: exactitud de temperatura
+ *     tipica 0.45 C, maxima +-0.7 C (15-30 C, 50 %RH). Su nota 13 aclara que
+ *     el autocalentamiento DEL MODULO ya viene compensado de fabrica, y el
+ *     sensor admite ademas sus propios parametros de offset por I2C
+ *     (comandos "Set Temperature Offset Parameters" 4.8.16 y "Set Temperature
+ *     Acceleration Parameters" 4.8.17, no usados aqui).
+ * Por eso TEMP_OFFSET_SEN65_C suele necesitar mucho menos ajuste que el del
+ * BM688: lo que corrige es el calor de NUESTRA caja, no el del modulo.
+ *
+ * Estas constantes se RESTAN a la lectura cruda, asi que valen los GRADOS QUE
+ * EL SENSOR LEE DE MAS:
+ *      offset = T_leida_por_el_sensor - T_real_del_aire
+ * Un sensor que marca 27.4 C cuando el aire esta a 25.0 C -> offset = +2.4.
+ * Si leyera de menos, el offset es NEGATIVO. 0.0 = sin compensar.
+ *
+ * COMO MEDIRLO (una vez por montaje, no por sensor suelto):
+ *   1. Nodo montado en su caja definitiva, cerrada, y en REGIMEN: WiFi AP
+ *      encendido y LoRa transmitiendo su ciclo normal. Dejalo >= 30 min; el
+ *      autocalentamiento tarda en estabilizarse.
+ *   2. A la sombra y sin corrientes de aire, con un termometro de referencia
+ *      pegado a la caja (misma masa de aire, no al sol).
+ *   3. Anota varias parejas (lectura del log, referencia) durante >= 15 min y
+ *      promedia la diferencia. El LOG DEL DRIVER (bm688.c "T=..C") imprime el
+ *      valor CRUDO, sin compensar: es justo el que necesitas para este paso.
+ *   4. Escribe el promedio aqui, sube FW_VERSION y reflashea.
+ *
+ * OJO: el offset corrige el SESGO, no la incertidumbre. Tras calibrar sigues
+ * teniendo la dispersion del sensor (~+-1 C) mas lo que cambie el montaje con
+ * el sol y el viento. No prometas +-0.5 C en campo.
+ *
+ * Que afecta y que no:
+ *   - SI afecta: el payload de datos (FPort 2), las alertas (FPort 4), el
+ *     umbral fijo TH_TEMP_MAX y lo que muestra el portal. La compensacion se
+ *     aplica NADA MAS LEER, asi que aguas abajo todo ve el valor corregido y
+ *     coherente.
+ *   - NO afecta al rate-of-rise EN 54-5 (TH_ROR_CPMIN): es una DIFERENCIA
+ *     dentro de una ventana de 60 s y un sesgo constante se cancela solo. Por
+ *     eso el ROR ya era fiable sin calibrar, y el umbral fijo no.
+ */
+#define TEMP_OFFSET_BM688_C   0.0    /* grados C que el BM688 lee DE MAS */
+#define TEMP_OFFSET_SEN65_C   0.0    /* grados C que el SEN65 lee DE MAS */
 
 /* =======================================================================
  *  UMBRALES DE ALERTA   <-- DEFINE AQUI LOS VALORES
@@ -822,6 +883,10 @@ int main(void)
             struct bm688_data sd;
             int r = bm688_read_data(bm688_dev, &sd);
             if (r == 0) {
+                /* Compensacion de autocalentamiento: se aplica AQUI, antes de
+                   acumular y de la snapshot, para que payload, umbrales y
+                   portal vean todos el mismo valor corregido. */
+                sd.temperature -= TEMP_OFFSET_BM688_C;
                 acc.temp_sum  += sd.temperature;
                 acc.hum_sum   += sd.humidity;
                 acc.press_sum += sd.pressure;
@@ -876,6 +941,7 @@ int main(void)
             struct sen6x_data ad;
             int ar = sen6x_read(sen65_dev, &ad);
             if (ar == 0) {
+                ad.temperature -= TEMP_OFFSET_SEN65_C;   /* ver CALIBRACION */
                 acc.pm1_sum   += ad.pm1_0;
                 acc.pm25_sum  += ad.pm2_5;
                 acc.pm4_sum   += ad.pm4_0;

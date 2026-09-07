@@ -19,6 +19,10 @@ https://es.farnell.com/sensirion/sen65-sin-t/m-dulo-de-sensor-digital-i2c/dp/478
 - [Integración ZE15-CO](docs/ZE15_CO_INTEGRATION.md) — monóxido de carbono, UART1.
 - [Integración SEN65](docs/SEN65_INTEGRATION.md) — calidad de aire (PM/VOC/NOx/RH&T), I2C1.
 
+**Conformidad y calibración**
+- [Conformidad con el pliego](docs/CONFORMIDAD_PLIEGO.md) — requisito a requisito (viento, T/HR, CO, CO₂, presión, IAQ) contrastado contra las hojas de datos oficiales.
+- [Offset de temperatura](docs/CALIBRACION_TEMPERATURA.md) — por qué los sensores leen de más, cómo medir el sesgo del montaje y dónde configurarlo.
+
 **Mensaje LoRa / ChirpStack**
 - [Flujo de datos y mensaje LoRa](docs/FLUJO_DATOS_LORA.md) — visión end-to-end sensores → LoRa → ChirpStack.
 - [Envío de sensores](docs/envio_sensores.md) — conformación del mensaje, decodificación, tiempos mínimos y qué pasa con los datos entre envíos.
