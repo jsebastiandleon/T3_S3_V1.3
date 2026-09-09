@@ -151,6 +151,8 @@ reloj, por eso los intervalos se expresan y se cambian en segundos.
 ```c
 #define LORA_SEND_PERIOD_S    720   // cada cuánto se ENVÍA por LoRa (FPort 2)
 #define SENSOR_READ_PERIOD_S  5     // cada cuánto se LEEN los sensores
+#define JOIN_BOOT_ATTEMPTS    3     // intentos de join al arrancar
+#define JOIN_RETRY_PERIOD_S   300   // reintento de join si el nodo está sin red
 ```
 
 Están desacopladas a propósito:
@@ -167,11 +169,12 @@ el orden del lazo *es* la política de prioridad:
 
 ```
 while (1) {
-    if (aviso pendiente) -> lorawan_send(FPORT_INCID,...)       // inmediato
-    leer BM688 / ZE15-CO / SEN65
+    if (joined && aviso pendiente) -> lorawan_send(FPORT_INCID,...)  // inmediato
+    leer BM688 / ZE15-CO / SEN65                        <- SIEMPRE, haya red o no
       -> acumular (sumas + contador), publicar al portal
       -> actualizar SALUD: 3 fallos seguidos = sensor EN FALLO
     now = k_uptime_get()
+    if (!joined) reintentar join cada JOIN_RETRY_PERIOD_S
     revisar UMBRALES (+ rate-of-rise EN 54-5, multicriterio EN 54-30/31)
 
     // --- por orden de prioridad de airtime ---
@@ -186,6 +189,11 @@ while (1) {
 
 Cada nivel sólo transmite si los de arriba no reclaman la radio en ese ciclo. Lo
 que no sale queda **pendiente** y se reintenta; nada se descarta en silencio.
+
+**Sin red LoRa** los cuatro niveles se saltan enteros, pero la lectura de
+sensores, el portal cautivo y la detección local siguen funcionando: medir no
+depende de la radio. El aviso de incidencia no se llega ni a *consumir* del
+portal (`portal_take_incident()` lo borraría) para que salga en cuanto haya red.
 
 ### Cuántas muestras entran en cada envío
 Nominalmente `LORA_SEND_PERIOD_S / SENSOR_READ_PERIOD_S`. Con 720/5 = 144

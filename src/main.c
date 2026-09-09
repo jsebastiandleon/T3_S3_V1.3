@@ -125,6 +125,24 @@ static void i2c1_scan(void)
 #define LINK_MAX_FAILS        3
 
 /* =======================================================================
+ *  JOIN QUE NO SECUESTRA AL NODO
+ * =======================================================================
+ * El join de arranque se intenta JOIN_BOOT_ATTEMPTS veces y luego SE SIGUE,
+ * con o sin red. Si no hay LoRa, el lazo principal reintenta el join cada
+ * JOIN_RETRY_PERIOD_S sin dejar de leer sensores ni de servir el portal.
+ *
+ * Antes el bucle de join era infinito: un nodo fuera de cobertura no llegaba
+ * nunca al lazo, no leia un solo sensor y el portal cautivo mostraba "--" en
+ * todo aunque los tres sensores funcionasen. La medida local no depende de la
+ * radio y no debe esperarla.
+ *
+ * 5 min de reintento: un join cuesta ~2 uplinks de airtime, asi que a esta
+ * cadencia el duty-cycle EU868 aguanta de sobra y una cobertura que vuelve se
+ * recupera pronto. */
+#define JOIN_BOOT_ATTEMPTS    3
+#define JOIN_RETRY_PERIOD_S   300
+
+/* =======================================================================
  *  CANALES (FPorts) — cada tipo de mensaje va por su PROPIO FPort, para
  *  poder enrutarlos/actuar por separado en ChirpStack.
  * ======================================================================= */
@@ -142,7 +160,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0205   /* v2.5 — telefonos de incidencia + aviso FPort 3 */
+#define FW_VERSION    0x0205   /* v2.5 — incidencia FPort 3 + sensores sin LoRa */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -648,17 +666,33 @@ int main(void)
         },
     };
 
-    for (int attempt = 1; ; attempt++) {
-        printk("JOINING... attempt %d\n", attempt);
+    /* Ver "JOIN QUE NO SECUESTRA AL NODO": se intenta un numero ACOTADO de
+       veces y se entra al lazo principal se consiga o no. 'joined' gobierna
+       a partir de aqui todo uso de la radio; los sensores y el portal
+       funcionan igual con red o sin ella. */
+    bool joined = false;
+
+    for (int attempt = 1; attempt <= JOIN_BOOT_ATTEMPTS; attempt++) {
+        printk("JOINING... attempt %d/%d\n", attempt, JOIN_BOOT_ATTEMPTS);
         ret = lorawan_join(&join_cfg);
         if (ret == 0) {
+            joined = true;
             break;
         }
-        printk("JOIN ERR: %d (retry in 10s)\n", ret);
-        k_sleep(K_SECONDS(10));
+        printk("JOIN ERR: %d\n", ret);
+        if (attempt < JOIN_BOOT_ATTEMPTS) {
+            k_sleep(K_SECONDS(10));
+        }
     }
-    printk("JOINED!\n");
-    portal_set_lora(true, false);
+
+    if (joined) {
+        printk("JOINED!\n");
+    } else {
+        printk("SIN LORA tras %d intentos: se continua con sensores y portal "
+               "(reintento de join cada %d s)\n",
+               JOIN_BOOT_ATTEMPTS, JOIN_RETRY_PERIOD_S);
+    }
+    portal_set_lora(joined, false);
 
     /*
      * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
@@ -825,6 +859,11 @@ int main(void)
 
     int64_t last_send_ms = 0;
 
+    /* Reintento de join cuando se arranca (o se queda) sin red. Se siembra con
+       el instante actual para no encadenar un cuarto intento justo despues de
+       los JOIN_BOOT_ATTEMPTS del arranque. */
+    int64_t last_join_ms = k_uptime_get();
+
     /* Salud por sensor. Un sensor que no llego a inicializarse nace YA en
        fallo: si no, la mascara 'faulted' del reporte lo daria por sano
        simplemente porque nunca se le lee. Eso no genera transicion (nunca
@@ -880,7 +919,10 @@ int main(void)
            airtime, y el aviso importante (la llamada de telefono) ya ha salido
            por otra via. Si el uplink se pierde, el contador 'count' del
            siguiente aviso delata al servidor que hubo uno que no llego. */
-        {
+        /* Sin join no se toca el aviso: portal_take_incident() lo CONSUME, y
+           consumirlo sin poder transmitirlo lo perderia en silencio. Queda
+           pendiente en el portal y sale en cuanto haya red. */
+        if (joined) {
             uint8_t  isrc;
             uint16_t icount;
 
@@ -1004,14 +1046,34 @@ int main(void)
 
         int64_t now = k_uptime_get();
 
+        /* ---- Reintento de join (nodo sin red) --------------------------
+         * Los sensores y el portal ya han hecho su trabajo mas arriba en este
+         * mismo ciclo: aqui solo se intenta recuperar la radio. lorawan_join()
+         * bloquea unos segundos esperando las ventanas de join, lo que como
+         * mucho retrasa un ciclo de lectura. */
+        if (!joined &&
+            (now - last_join_ms) >= (int64_t)JOIN_RETRY_PERIOD_S * 1000) {
+            last_join_ms = now;
+            int jr = lorawan_join(&join_cfg);
+            if (jr == 0) {
+                joined = true;
+                printk("JOIN OK tras reintento: LoRa operativo\n");
+                portal_set_lora(true, false);
+            } else {
+                printk("JOIN reintento ERR: %d (otro en %d s)\n",
+                       jr, JOIN_RETRY_PERIOD_S);
+            }
+        }
+
         /* ---- Hora de red y franja nocturna del SoftAP ------------------
          * La unica fuente de hora del nodo es el DeviceTimeReq de LoRaWAN
          * (no hay RTC con pila, y el SoftAP no da salida a Internet). Se pide
          * con force_request=false: el comando MAC viaja piggyback en el
          * siguiente uplink de datos, sin gastar airtime ni duty-cycle propios.
          */
-        if (last_time_req_ms == 0 ||
-            (now - last_time_req_ms) >= (int64_t)TIME_RESYNC_H * 3600 * 1000) {
+        if (joined &&
+            (last_time_req_ms == 0 ||
+             (now - last_time_req_ms) >= (int64_t)TIME_RESYNC_H * 3600 * 1000)) {
             int tr = lorawan_request_device_time(false);
             if (tr < 0) {
                 printk("DeviceTimeReq err: %d\n", tr);
@@ -1176,7 +1238,8 @@ int main(void)
          * confirmado, que por criticidad intenta salir igualmente.
          * Asi el FPort 4 NUNCA puede quitarle el slot al FPort 2.
          * ============================================================= */
-        bool data_due = (last_send_ms == 0 ||
+        bool data_due = joined &&
+                        (last_send_ms == 0 ||
                          (now - last_send_ms) >= (int64_t)LORA_SEND_PERIOD_S * 1000);
 
         /* ---- 1) DATOS (FPort 2) — MAXIMA PRIORIDAD ------------------- */
@@ -1252,16 +1315,26 @@ int main(void)
                            link_fails, LINK_MAX_FAILS, ret);
                     if (link_fails >= LINK_MAX_FAILS) {
                         printk("ENLACE CAIDO -> REJOIN\n");
+                        joined = false;
                         portal_set_lora(false, false);
-                        for (int a = 1; a <= 3; a++) {
+                        for (int a = 1; a <= JOIN_BOOT_ATTEMPTS; a++) {
                             int jr = lorawan_join(&join_cfg);
                             if (jr == 0) {
                                 printk("REJOIN OK (intento %d)\n", a);
+                                joined = true;
                                 portal_set_lora(true, false);
                                 break;
                             }
-                            printk("REJOIN ERR %d (intento %d/3)\n", jr, a);
+                            printk("REJOIN ERR %d (intento %d/%d)\n", jr, a,
+                                   JOIN_BOOT_ATTEMPTS);
                             k_sleep(K_SECONDS(10));
+                        }
+                        /* Si el rejoin no lo consigue, el nodo se queda SIN
+                           red de forma declarada (joined=false): deja de
+                           transmitir al vacio, el portal lo pinta en rojo y
+                           el reintento periodico se encarga desde aqui. */
+                        if (!joined) {
+                            last_join_ms = k_uptime_get();
                         }
                         link_fails = 0;   /* re-armar; si sigue mal, reintenta */
                     }
@@ -1284,7 +1357,7 @@ int main(void)
         bool cooldown_ok   = (fire_now || last_alert_ms == 0 ||
                               (now - last_alert_ms) >= (int64_t)ALERT_MIN_INTERVAL_S * 1000);
 
-        if (alert_pending != 0 && alert_slot_ok && cooldown_ok) {
+        if (joined && alert_pending != 0 && alert_slot_ok && cooldown_ok) {
             /* El mask reporta que umbrales CRUZARON en la ventana (pending),
                nunca 0; alert_active es solo informativo (que sigue alto ahora). */
             alert.alert_mask = alert_pending;
@@ -1301,8 +1374,9 @@ int main(void)
             /* si falla queda pendiente y reintenta luego, SIN tocar el FPort 2 */
         } else if (alert_pending != 0) {
             /* Diagnostico: por que se aplaza la alerta (nunca se pierde). */
-            printk("ALERTA aplazada pend=0x%02x (data_due=%d cooldown_ok=%d)\n",
-                   alert_pending, (int)data_due, (int)cooldown_ok);
+            printk("ALERTA aplazada pend=0x%02x (join=%d data_due=%d "
+                   "cooldown_ok=%d)\n", alert_pending, (int)joined,
+                   (int)data_due, (int)cooldown_ok);
         }
 
         /* ---- 3) FALLO DE SENSOR (FPort 5, msg_type 2) ----------------
@@ -1318,7 +1392,7 @@ int main(void)
          */
         bool fault_pending = (fault_down_pending | fault_up_pending) != 0;
 
-        if (fault_pending && !data_due && alert_pending == 0 &&
+        if (joined && fault_pending && !data_due && alert_pending == 0 &&
             (now - last_send_ms) >= (int64_t)FAULT_MIN_SPACING_S * 1000 &&
             (last_fault_ms == 0 ||
              (now - last_fault_ms) >= (int64_t)FAULT_MIN_SPACING_S * 1000)) {
@@ -1358,7 +1432,8 @@ int main(void)
          * puede degradar jamas al canal critico, a una alarma ni a una
          * señal de averia.
          */
-        if (diag_pending && !data_due && alert_pending == 0 && !fault_pending &&
+        if (joined && diag_pending && !data_due && alert_pending == 0 &&
+            !fault_pending &&
             (now - last_send_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000 &&
             (last_diag_ms == 0 ||
              (now - last_diag_ms) >= (int64_t)DIAG_MIN_SPACING_S * 1000)) {

@@ -101,7 +101,13 @@ AppKey : 062635ACC3BBC92C2FEF994F5EF0F69B
 ```
 
 Secuencia al arrancar: `lorawan_start()` → `lorawan_enable_adr(true)` →
-`lorawan_join()` (OTAA, reintenta cada 10 s hasta unir) → bucle de envío.
+`lorawan_join()` (OTAA, **3 intentos** separados 10 s) → bucle principal.
+
+El join **no bloquea al nodo**: si los 3 intentos fallan se entra igualmente en
+el lazo, que sigue leyendo los sensores y sirviendo el portal cautivo, y
+reintenta el join cada `JOIN_RETRY_PERIOD_S` (300 s) hasta conseguirlo. Mientras
+no hay red, ningún canal transmite (los avisos y las alertas quedan pendientes,
+no se pierden) y el portal lo indica con el título en rojo.
 
 ---
 
