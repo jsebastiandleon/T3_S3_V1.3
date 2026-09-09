@@ -14,12 +14,12 @@ FPort para poder enrutarlo/actuar por separado en ChirpStack:
 | FPort | Sentido | Contenido |
 |---|---|---|
 | **2** | uplink | **Datos** periódicos (promedio de la ventana), 29 B. Este doc §2. |
-| **3** | uplink | **SOS** del botón del portal: ASCII `"SOS"` (3 B) → `{"alert":"SOS","source":"panic_button"}`. |
+| **3** | uplink | **Aviso de incidencia** del portal (4 B): `msg_type`=1, `source` (1=962878800, 2=092), `count` u16 LE → `{"alert":"INCIDENCIA","source":"portal_call","llamada":"962878800","avisos":N}`. Los nodos con firmware antiguo mandan aquí el ASCII `"SOS"` (3 B) del botón retirado; el decoder lo sigue reconociendo con `legacy:true`. |
 | **4** | uplink | **Alerta por umbral** (threshold), 15 B. Ver §2.1. |
 | **10** | downlink | Actualización OTA del HTML del portal (BEGIN/DATA/COMMIT). |
 
 Los FPorts de envío se definen en el bloque *CANALES (FPorts)* al principio de
-`src/main.c` (`FPORT_DATA`, `FPORT_SOS`, `FPORT_ALERT`).
+`src/main.c` (`FPORT_DATA`, `FPORT_INCID`, `FPORT_ALERT`).
 
 ---
 

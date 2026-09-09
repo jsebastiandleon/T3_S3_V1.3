@@ -129,7 +129,7 @@ static void i2c1_scan(void)
  *  poder enrutarlos/actuar por separado en ChirpStack.
  * ======================================================================= */
 #define FPORT_DATA    2   /* datos periodicos (promedio de la ventana)   */
-#define FPORT_SOS     3   /* boton de emergencia del portal cautivo      */
+#define FPORT_INCID   3   /* aviso de incidencia desde el portal cautivo */
 #define FPORT_ALERT   4   /* alertas automaticas por umbral (threshold)  */
 #define FPORT_DIAG    5   /* salud del nodo: arranque, causa de reset    */
 
@@ -142,7 +142,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0204   /* v2.4 — compensacion de offset de temperatura */
+#define FW_VERSION    0x0205   /* v2.5 — telefonos de incidencia + aviso FPort 3 */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -658,6 +658,7 @@ int main(void)
         k_sleep(K_SECONDS(10));
     }
     printk("JOINED!\n");
+    portal_set_lora(true, false);
 
     /*
      * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
@@ -865,13 +866,44 @@ int main(void)
     int     ror_count = 0;
 
     while (1) {
-        /* Boton de emergencia: si el portal pidio SOS, enviar uplink inmediato
-           en FPort 3 (mensaje "SOS", no datos). Latencia <= 1 ciclo (~5 s). */
-        if (portal_take_sos()) {
-            static const uint8_t sos_msg[] = { 'S', 'O', 'S' };
-            int sret = lorawan_send(FPORT_SOS, (uint8_t *)sos_msg, sizeof(sos_msg),
-                                    LORAWAN_MSG_UNCONFIRMED);
-            printk("SOS enviado (FPort %d): %d\n", FPORT_SOS, sret);
+        /* Aviso de incidencia: alguien ha tocado un telefono en el portal
+           para llamar a la Policia Local. La llamada avisa a las personas;
+           este uplink avisa al SERVIDOR (FPort 3 -> ChirpStack -> MQTT), que
+           es lo unico que deja rastro del incidente en el sistema.
+           Latencia <= 1 ciclo del lazo (~5 s).
+
+           Va lo PRIMERO del ciclo, por delante de los datos periodicos, por
+           la misma razon que las alertas: es informacion de evento y no debe
+           esperar a la ventana de envio.
+
+           UNCONFIRMED a proposito: un ACK obligaria a reintentos que gastan
+           airtime, y el aviso importante (la llamada de telefono) ya ha salido
+           por otra via. Si el uplink se pierde, el contador 'count' del
+           siguiente aviso delata al servidor que hubo uno que no llego. */
+        {
+            uint8_t  isrc;
+            uint16_t icount;
+
+            if (portal_take_incident(&isrc, &icount)) {
+                /* Payload de AVISO DE INCIDENCIA (FPORT_INCID, 4 bytes, LE).
+                   msg_type deja sitio a otros eventos futuros en este FPort. */
+                struct {
+                    uint8_t  msg_type;  /* 1 = aviso de incidencia (portal) */
+                    uint8_t  source;    /* 1 = 962878800, 2 = 092           */
+                    uint16_t count;     /* avisos desde el arranque         */
+                } __packed incid = {
+                    .msg_type = 1,
+                    .source   = isrc,
+                    .count    = icount,
+                };
+                BUILD_ASSERT(sizeof(incid) == 4,
+                             "FPORT_INCID debe ocupar 4 bytes");
+
+                int sret = lorawan_send(FPORT_INCID, (uint8_t *)&incid,
+                                        sizeof(incid), LORAWAN_MSG_UNCONFIRMED);
+                printk("Aviso de incidencia enviado (FPort %d, origen %u, "
+                       "n=%u): %d\n", FPORT_INCID, isrc, icount, sret);
+            }
         }
 
         ps.bm688_valid = false;
@@ -1199,6 +1231,9 @@ int main(void)
             } else {
                 printk("SEND OK\n");
             }
+            /* Al indicador del portal: 'joined' sigue siendo cierto aunque
+               este envio fallase; lo que cambia es la marca de ultimo OK. */
+            portal_set_lora(true, ret == 0);
             last_send_ms = now;
             memset(&acc, 0, sizeof(acc));   /* nueva ventana de promediado */
 
@@ -1217,10 +1252,12 @@ int main(void)
                            link_fails, LINK_MAX_FAILS, ret);
                     if (link_fails >= LINK_MAX_FAILS) {
                         printk("ENLACE CAIDO -> REJOIN\n");
+                        portal_set_lora(false, false);
                         for (int a = 1; a <= 3; a++) {
                             int jr = lorawan_join(&join_cfg);
                             if (jr == 0) {
                                 printk("REJOIN OK (intento %d)\n", a);
+                                portal_set_lora(true, false);
                                 break;
                             }
                             printk("REJOIN ERR %d (intento %d/3)\n", jr, a);

@@ -72,19 +72,46 @@ void portal_update_sensors(const struct portal_sensors *s);
 /* Copia atomica del snapshot actual (para el handler HTTP). */
 void portal_get_sensors(struct portal_sensors *out);
 
-/* ---- Boton de emergencia (SOS) ----------------------------------------- */
-/* portal_request_sos(): lo llama el handler HTTP /api/sos (hilo del servidor).
- * portal_take_sos():    lo consume el lazo principal; devuelve true UNA vez si
- *                       habia un SOS pendiente (y lo limpia) -> envia uplink LoRa
- *                       de SOS en FPort 3. Thread-safe (atomic). */
-void portal_request_sos(void);
-bool portal_take_sos(void);
+/* ---- Aviso de incidencia ------------------------------------------------ */
+/* El portal ya no lleva boton de SOS por radio: lleva los telefonos de la
+ * Policia Local. Al tocar uno, ademas de abrirse el marcador del movil, la
+ * pagina avisa al nodo para que el SERVIDOR se entere de que alguien esta
+ * comunicando una incidencia (uplink FPort 3 -> ChirpStack -> MQTT).
+ *
+ * Origen del aviso = que telefono se toco. Va en el payload para que el
+ * servidor sepa si la llamada fue al numero de oficina o al 092. */
+#define PORTAL_INCIDENT_NONE       0
+#define PORTAL_INCIDENT_POLICIA    1   /* 962878800, Policia Local Gandia */
+#define PORTAL_INCIDENT_URGENCIAS  2   /* 092, urgencias                  */
+
+/* portal_report_incident(): lo llaman los handlers HTTP de /api/aviso (hilo del
+ *                       servidor HTTP).
+ * portal_take_incident(): lo consume el lazo principal; devuelve true UNA vez
+ *                       si habia un aviso pendiente (y lo limpia), dejando en
+ *                       *source el origen y en *count cuantos avisos se han
+ *                       dado desde el arranque -> uplink LoRa en FPort 3.
+ *                       Thread-safe (atomic). */
+void portal_report_incident(uint8_t source);
+bool portal_take_incident(uint8_t *source, uint16_t *count);
+
+/* ---- Estado del enlace LoRa (indicador discreto del portal) ------------- */
+/* El portal sirve /api/sensors, que hasta ahora solo hablaba de sensores. El
+ * panel lleva un indicador MUY discreto del estado de radio: no es para el
+ * vecino que abre el portal, es para quien mantiene el nodo. Por eso hace
+ * falta publicar el estado aqui.
+ *
+ * 'joined'  = la pila LoRaWAN completo el join.
+ * 'last_ok' = uptime del ultimo uplink que salio sin error (0 = ninguno aun).
+ *             Sirve para distinguir "unido pero mudo" de "unido y enviando",
+ *             que es la diferencia que importa cuando algo va mal. */
+void portal_set_lora(bool joined, bool send_ok);
+void portal_get_lora(bool *joined, int64_t *last_ok_age_ms);
 
 /* ---- HTML mutable del portal -------------------------------------------- */
 
 /* Tamano maximo del HTML servido/actualizable. Subido a 10K para el dashboard
    con graficos. OJO: hay 2 buffers de este tamano (vivo + staging OTA). */
-#define PORTAL_HTML_MAX 10240
+#define PORTAL_HTML_MAX 16384
 
 /* Carga el HTML desde Settings (NVS); si no existe usa el default empotrado.
  * Lo llama portal_start(); expuesto por claridad. */

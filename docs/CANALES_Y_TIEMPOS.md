@@ -7,12 +7,12 @@
 En LoRaWAN no hay "canales de aplicación" como tal; el campo que separa **tipos
 de mensaje** es el **FPort** (0–255) de cada trama. El nodo usa uno distinto por
 tipo, para que en ChirpStack puedas **enrutar/actuar cada uno por separado**
-(p.ej. datos → base de datos; SOS y alertas → webhook/email).
+(p.ej. datos → base de datos; avisos de incidencia y alertas → webhook/email).
 
 | FPort | Sentido | Contenido | Cuándo se envía |
 |---|---|---|---|
 | **2** `FPORT_DATA` | uplink | Datos de sensores (promedio), 29 B | cada `LORA_SEND_PERIOD_S` |
-| **3** `FPORT_SOS` | uplink | `"SOS"` (3 B) del botón del portal | al pulsar el botón (≤1 ciclo) |
+| **3** `FPORT_INCID` | uplink | Aviso de incidencia (4 B) del portal | al tocar un teléfono en el portal (≤1 ciclo) |
 | **4** `FPORT_ALERT` | uplink | Alerta por umbral (15 B) | al cruzar un umbral (flanco) |
 | **5** `FPORT_DIAG` | uplink | Salud del nodo (13/14 B) | al arrancar y al caer/recuperarse un sensor |
 | **10** `PORTAL_HTML_OTA_FPORT` | downlink | Actualización OTA del HTML | cuando mandas el downlink |
@@ -21,10 +21,31 @@ Los FPort de subida se definen arriba de `main.c`:
 
 ```c
 #define FPORT_DATA    2
-#define FPORT_SOS     3
+#define FPORT_INCID   3
 #define FPORT_ALERT   4
 #define FPORT_DIAG    5
 ```
+
+### FPort 3 — aviso de incidencia
+
+No lo dispara el nodo: lo dispara **una persona**. El portal cautivo ya no
+lleva botón de SOS por radio, lleva los teléfonos de la Policía Local de
+Gandia. Al tocar uno, el móvil abre el marcador **y** la página pega un GET a
+`/api/aviso/policia` o `/api/aviso/urgencias`; el nodo manda entonces este
+uplink para que el servidor se entere de que alguien está comunicando algo.
+
+| Byte | Campo | Valor |
+|---|---|---|
+| 0 | `msg_type` | `1` = aviso de incidencia desde el portal |
+| 1 | `source` | `1` = 962878800 (Policía Local) · `2` = 092 (urgencias) |
+| 2-3 | `count` (u16 LE) | avisos acumulados desde el arranque del nodo |
+
+Va **UNCONFIRMED**: el aviso que de verdad importa (la llamada de teléfono) ya
+ha salido por otra vía, y pedir ACK obligaría a reintentos que gastan airtime.
+Por eso está el contador: si el servidor ve saltar `avisos` de 3 a 5, sabe que
+un uplink intermedio se perdió. Dos toques dentro del mismo ciclo del lazo
+(~5 s) se colapsan en un solo uplink con el último origen tocado, pero `count`
+los cuenta los dos.
 
 ### FPort 5 — salud del nodo
 
@@ -146,7 +167,7 @@ el orden del lazo *es* la política de prioridad:
 
 ```
 while (1) {
-    if (SOS pendiente)  -> lorawan_send(FPORT_SOS,...)          // inmediato
+    if (aviso pendiente) -> lorawan_send(FPORT_INCID,...)       // inmediato
     leer BM688 / ZE15-CO / SEN65
       -> acumular (sumas + contador), publicar al portal
       -> actualizar SALUD: 3 fallos seguidos = sensor EN FALLO
@@ -332,7 +353,7 @@ Detalle completo (tabla por SF, condiciones) en
 |---|---|---|
 | Enviar datos más/menos seguido | `LORA_SEND_PERIOD_S` (s) | `src/main.c` (bloque *CONFIGURACION DE TIEMPOS*) |
 | Muestrear/promediar más fino | `SENSOR_READ_PERIOD_S` (s) | íd. |
-| Cambiar un canal | `FPORT_DATA/SOS/ALERT` | `src/main.c` (bloque *CANALES*) |
+| Cambiar un canal | `FPORT_DATA/INCID/ALERT` | `src/main.c` (bloque *CANALES*) |
 | Ajustar cuándo salta una alerta | `TH_*_MAX/MIN`, `TH_*_EN` | `src/main.c` (bloque *UMBRALES*) |
 | Evitar alertas repetidas | `TH_HYSTERESIS_PCT`, `ALERT_MIN_INTERVAL_S` | íd. |
 

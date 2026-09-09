@@ -3,6 +3,8 @@
  * = un HTTP_RESOURCE_DEFINE mas. De momento:
  *   GET /             -> dashboard HTML (mutable, desde el almacen portal_html)
  *   GET /api/sensors  -> JSON con el ultimo snapshot de sensores
+ *   GET /api/aviso/.. -> registra que se esta comunicando una incidencia
+ *                        (uno por telefono) y dispara el uplink FPort 3
  *   GET /gorila.jpg   -> imagen embebida
  *   <fallback>        -> 302 redirect a http://192.168.4.1/ ante CUALQUIER ruta
  *                        no mapeada. Las URLs de sondeo del SO (Android
@@ -65,12 +67,15 @@ static int sensors_handler(struct http_client_ctx *client,
 			   struct http_response_ctx *rsp, void *user_data)
 {
 	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(user_data);
-	static char json[384];
+	static char json[448];
 
 	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
 		struct portal_sensors s;
+		bool lora_up;
+		int64_t lora_age;
 
 		portal_get_sensors(&s);
+		portal_get_lora(&lora_up, &lora_age);
 
 		int64_t age = (s.updated_uptime_ms == 0)
 			      ? -1 : (k_uptime_get() - s.updated_uptime_ms);
@@ -98,6 +103,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			"\"sen65\":%s,\"pm1_0\":%d.%d,\"pm2_5\":%d.%d,"
 			"\"pm4_0\":%d.%d,\"pm10_0\":%d.%d,\"voc\":%d,\"nox\":%d,"
 			"\"s_temp\":%d.%02d,\"s_hum\":%d.%02d,"
+			"\"lora\":%s,\"lora_ms\":%lld,"
 			"\"age_ms\":%lld}",
 			s.bm688_valid ? "true" : "false", t_i, t_f, h_i, h_f,
 			(int)s.pressure, (int)s.gas_resistance,
@@ -106,6 +112,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			p1_i, p1_f, p25_i, p25_f, p4_i, p4_f, p10_i, p10_f,
 			(int)s.voc_index, (int)s.nox_index,
 			st_i, st_f, sh_i, sh_f,
+			lora_up ? "true" : "false", (long long)lora_age,
 			(long long)age);
 
 		rsp->status = HTTP_200_OK;
@@ -126,18 +133,26 @@ static struct http_resource_detail_dynamic sensors_resource = {
 	.cb = sensors_handler,
 };
 
-/* ---- GET /api/sos: dispara un uplink LoRa de emergencia ----------------- */
-static int sos_handler(struct http_client_ctx *client,
-		       enum http_transaction_status status,
-		       const struct http_request_ctx *req,
-		       struct http_response_ctx *rsp, void *user_data)
+/* ---- GET /api/aviso/{policia,urgencias} --------------------------------- */
+/* La pagina los llama al tocar un telefono, ANTES de que el movil abra el
+ * marcador: la llamada avisa a la Policia Local y este uplink avisa al
+ * servidor de que la llamada se esta produciendo.
+ *
+ * Un handler unico para los dos: el telefono concreto llega por user_data, que
+ * es la unica via limpia de distinguirlos (http_request_ctx no expone la URL,
+ * asi que no se puede leer un query string tipo ?n=1). */
+static int aviso_handler(struct http_client_ctx *client,
+			 enum http_transaction_status status,
+			 const struct http_request_ctx *req,
+			 struct http_response_ctx *rsp, void *user_data)
 {
-	ARG_UNUSED(client); ARG_UNUSED(req); ARG_UNUSED(user_data);
-	static const char ok[] = "{\"sos\":\"queued\"}";
+	ARG_UNUSED(client); ARG_UNUSED(req);
+	static const char ok[] = "{\"aviso\":\"queued\"}";
+	uint8_t src = (uint8_t)(uintptr_t)user_data;
 
 	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
-		portal_request_sos();
-		LOG_WRN("SOS solicitado desde el portal");
+		portal_report_incident(src);
+		LOG_WRN("Aviso de incidencia desde el portal (origen %u)", src);
 		rsp->status = HTTP_200_OK;
 		rsp->headers = json_ctype;
 		rsp->header_count = ARRAY_SIZE(json_ctype);
@@ -148,12 +163,22 @@ static int sos_handler(struct http_client_ctx *client,
 	return 0;
 }
 
-static struct http_resource_detail_dynamic sos_resource = {
+static struct http_resource_detail_dynamic aviso_policia_resource = {
 	.common = {
 		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
 		.bitmask_of_supported_http_methods = BIT(HTTP_GET),
 	},
-	.cb = sos_handler,
+	.cb = aviso_handler,
+	.user_data = (void *)(uintptr_t)PORTAL_INCIDENT_POLICIA,
+};
+
+static struct http_resource_detail_dynamic aviso_urgencias_resource = {
+	.common = {
+		.type = HTTP_RESOURCE_TYPE_DYNAMIC,
+		.bitmask_of_supported_http_methods = BIT(HTTP_GET),
+	},
+	.cb = aviso_handler,
+	.user_data = (void *)(uintptr_t)PORTAL_INCIDENT_URGENCIAS,
 };
 
 /* ---- Fallback de portal cautivo: 302 redirect a la pagina --------------- */
@@ -201,4 +226,7 @@ HTTP_SERVICE_DEFINE(portal_http_service, NULL, &http_port, 4, 8, NULL,
 HTTP_RESOURCE_DEFINE(portal_index, portal_http_service, "/", &index_resource);
 HTTP_RESOURCE_DEFINE(portal_sensors, portal_http_service, "/api/sensors",
 		     &sensors_resource);
-HTTP_RESOURCE_DEFINE(portal_sos, portal_http_service, "/api/sos", &sos_resource);
+HTTP_RESOURCE_DEFINE(portal_aviso_pol, portal_http_service, "/api/aviso/policia",
+		     &aviso_policia_resource);
+HTTP_RESOURCE_DEFINE(portal_aviso_urg, portal_http_service, "/api/aviso/urgencias",
+		     &aviso_urgencias_resource);

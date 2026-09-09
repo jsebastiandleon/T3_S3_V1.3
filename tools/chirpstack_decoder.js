@@ -2,7 +2,7 @@
  * ChirpStack v4 — Codec (Device Profile > Codec > JavaScript functions).
  * Decoder del nodo T3-S3 (BM688 + ZE15-CO + SEN65). Ver docs/PAYLOAD_DECODER.md.
  *   FPort 2 -> datos v2 (29 B)      FPort 4 -> alerta por umbral (15 B)
- *   FPort 3 -> SOS (3 B)            FPort 5 -> salud del nodo (13 B)
+ *   FPort 3 -> aviso incidencia (4 B)  FPort 5 -> salud del nodo (13 B)
  *
  * DevEUI de pruebas: 1CDBD4FFFEBD2965
  */
@@ -15,9 +15,32 @@ function decodeUplink(input) {
   function s16(i) { var v = u16(i); return v > 32767 ? v - 65536 : v; }
   function u32(i) { return (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0; }
 
-  // FPort 3 = boton de EMERGENCIA (SOS), no datos de sensores.
+  // FPort 3 = AVISO DE INCIDENCIA: alguien ha tocado un telefono de la
+  // Policia Local en el portal cautivo del nodo. No son datos de sensores:
+  // es una persona diciendo que esta comunicando algo.
+  //
+  // 'avisos' es el contador desde el arranque del nodo. Si salta de 3 a 5, un
+  // aviso intermedio se perdio en el aire (van UNCONFIRMED): el hueco es la
+  // unica forma que tiene el servidor de enterarse.
   if (input.fPort === 3) {
-    return { data: { alert: "SOS", source: "panic_button" } };
+    // Nodos antiguos mandaban los 3 bytes ASCII "SOS" del boton retirado.
+    if (b.length === 3 && b[0] === 0x53 && b[1] === 0x4F && b[2] === 0x53) {
+      return { data: { alert: "SOS", source: "panic_button", legacy: true } };
+    }
+    if (b.length < 4) {
+      return { errors: ["aviso demasiado corto: " + b.length + " (esperado 4)"] };
+    }
+    if (b[0] !== 1) {
+      return { errors: ["msg_type desconocido en FPort 3: " + b[0]] };
+    }
+    var tel = b[1] === 1 ? "962878800" : (b[1] === 2 ? "092" : "desconocido");
+    return { data: {
+      alert:   "INCIDENCIA",
+      source:  "portal_call",          // toque en un telefono del portal
+      llamada: tel,                    // a que numero se llamo
+      destino: b[1] === 2 ? "urgencias" : "policia_local_gandia",
+      avisos:  u16(2)                  // acumulado desde el arranque del nodo
+    } };
   }
 
   // FPort 4 = ALERTA automatica por UMBRAL (threshold). 15 bytes.

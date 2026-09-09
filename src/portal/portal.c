@@ -45,18 +45,63 @@ void portal_get_sensors(struct portal_sensors *out)
 	k_mutex_unlock(&snapshot_lock);
 }
 
-/* ---- Boton de emergencia (SOS) ----------------------------------------- */
-static atomic_t sos_pending;
+/* ---- Estado del enlace LoRa -------------------------------------------- */
+/* Lo escribe el lazo principal y lo lee el hilo del servidor HTTP. Bajo el
+ * mismo mutex que la snapshot: son dos valores que se leen juntos y no vale
+ * la pena un segundo candado. */
+static bool    lora_joined;
+static int64_t lora_last_ok_ms;   /* uptime del ultimo envio OK, 0 = ninguno */
 
-void portal_request_sos(void)
+void portal_set_lora(bool joined, bool send_ok)
 {
-	atomic_set(&sos_pending, 1);
+	k_mutex_lock(&snapshot_lock, K_FOREVER);
+	lora_joined = joined;
+	if (send_ok) {
+		lora_last_ok_ms = k_uptime_get();
+	}
+	k_mutex_unlock(&snapshot_lock);
 }
 
-bool portal_take_sos(void)
+void portal_get_lora(bool *joined, int64_t *last_ok_age_ms)
 {
-	/* atomic_set devuelve el valor previo: limpia y avisa si estaba pendiente. */
-	return atomic_set(&sos_pending, 0) == 1;
+	k_mutex_lock(&snapshot_lock, K_FOREVER);
+	*joined = lora_joined;
+	*last_ok_age_ms = (lora_last_ok_ms == 0)
+			  ? -1 : (k_uptime_get() - lora_last_ok_ms);
+	k_mutex_unlock(&snapshot_lock);
+}
+
+/* ---- Aviso de incidencia (telefonos del portal) ------------------------- */
+/* 'pending' guarda el ORIGEN del aviso sin consumir (0 = nada pendiente), y
+ * 'total' cuenta todos los avisos desde el arranque.
+ *
+ * Si se tocan los dos telefonos dentro del mismo ciclo del lazo (~5 s) solo
+ * se envia un uplink, con el ultimo origen tocado; 'total' si refleja los dos,
+ * asi que el servidor puede ver que hubo mas avisos de los que le llegaron.
+ * Colapsarlos es deliberado: evita gastar airtime en toques repetidos. */
+static atomic_t incident_pending;
+static atomic_t incident_total;
+
+void portal_report_incident(uint8_t source)
+{
+	if (source == PORTAL_INCIDENT_NONE) {
+		return;
+	}
+	atomic_inc(&incident_total);
+	atomic_set(&incident_pending, (atomic_val_t)source);
+}
+
+bool portal_take_incident(uint8_t *source, uint16_t *count)
+{
+	/* atomic_set devuelve el valor previo: limpia y avisa de si habia algo. */
+	atomic_val_t s = atomic_set(&incident_pending, PORTAL_INCIDENT_NONE);
+
+	if (s == PORTAL_INCIDENT_NONE) {
+		return false;
+	}
+	*source = (uint8_t)s;
+	*count  = (uint16_t)atomic_get(&incident_total);
+	return true;
 }
 
 /* ---- Arranque ------------------------------------------------------------ */
