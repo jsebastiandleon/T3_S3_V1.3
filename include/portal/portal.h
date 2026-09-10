@@ -94,6 +94,13 @@ void portal_get_sensors(struct portal_sensors *out);
 void portal_report_incident(uint8_t source);
 bool portal_take_incident(uint8_t *source, uint16_t *count);
 
+/* portal_return_incident(): devuelve a pendiente un aviso que se consumio pero
+ * NO se pudo transmitir (p.ej. -111 de duty-cycle). Sin esto el aviso se
+ * perderia en silencio, que en el canal con el que se avisa de una llamada a
+ * la Policia Local no es aceptable. Si mientras tanto ha entrado una pulsacion
+ * nueva, esa gana: es mas reciente y no debe quedar pisada. */
+void portal_return_incident(uint8_t source);
+
 /* ---- Estado del enlace LoRa (indicador discreto del portal) ------------- */
 /* El portal sirve /api/sensors, que hasta ahora solo hablaba de sensores. El
  * panel lleva un indicador MUY discreto del estado de radio: no es para el

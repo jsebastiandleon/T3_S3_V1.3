@@ -196,7 +196,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0206   /* v2.6 — el verde del portal exige prueba de enlace */
+#define FW_VERSION    0x0208   /* v2.8 — aviso reencolado si falla el envio */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -992,6 +992,15 @@ int main(void)
                                         sizeof(incid), LORAWAN_MSG_UNCONFIRMED);
                 printk("Aviso de incidencia enviado (FPort %d, origen %u, "
                        "n=%u): %d\n", FPORT_INCID, isrc, icount, sret);
+                if (sret != 0) {
+                    /* El aviso ya estaba CONSUMIDO del portal, asi que sin
+                       esto se perderia en silencio. El fallo tipico es -111
+                       (duty-cycle) al pulsar justo despues de un envio de
+                       datos: nada que ver con que el aviso no importe. */
+                    portal_return_incident(isrc);
+                    printk("Aviso NO enviado (%d): reencolado, reintento en "
+                           "~%d s\n", sret, SENSOR_READ_PERIOD_S);
+                }
             }
         }
 

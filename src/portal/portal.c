@@ -107,6 +107,18 @@ bool portal_take_incident(uint8_t *source, uint16_t *count)
 	return true;
 }
 
+void portal_return_incident(uint8_t source)
+{
+	if (source == PORTAL_INCIDENT_NONE) {
+		return;
+	}
+	/* CAS y no set: solo restaura si el hueco sigue vacio. Una pulsacion que
+	 * haya entrado entre el take y el fallo del envio es mas reciente y manda.
+	 * 'incident_total' no se toca: cuenta pulsaciones reales, no intentos. */
+	(void)atomic_cas(&incident_pending, PORTAL_INCIDENT_NONE,
+			 (atomic_val_t)source);
+}
+
 /* ---- Arranque ------------------------------------------------------------ */
 static bool started;
 
