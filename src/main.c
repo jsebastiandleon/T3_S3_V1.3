@@ -112,16 +112,27 @@ static void i2c1_scan(void)
 /* =======================================================================
  *  SUPERVISION DEL ENLACE  (keepalive confirmado + auto-rejoin)
  * =======================================================================
- * Un uplink UNCONFIRMED no da NINGUNA pista de si llego: el nodo puede
- * transmitir horas al vacio y decir "SEND OK" siempre. Para detectar un
- * enlace muerto y recuperarlo solo:
+ * Un uplink UNCONFIRMED no da NINGUNA pista de si llego: lorawan_send()
+ * devuelve 0 en cuanto el transceptor termina de transmitir (lo confirma
+ * zephyr/subsys/lorawan/loramac-node/lorawan.c:726, que solo mira el
+ * mcps_confirm del TX). Sin gateway, sin cobertura o con la antena
+ * desconectada sigue devolviendo 0: el nodo puede transmitir horas al vacio
+ * y decir "SEND OK" siempre. Para detectar un enlace muerto y recuperarlo
+ * solo:
  *   - LINK_KEEPALIVE_EVERY: 1 de cada N envios de datos va CONFIRMED, para
  *     forzar un ACK del servidor (prueba de vida real del enlace).
  *   - LINK_MAX_FAILS: si ese numero de keepalives seguidos NO reciben ACK,
  *     se asume enlace caido y se hace REJOIN (vuelve a SF12, sesion nueva).
- * Con N=6 y periodo 180 s, se sondea ~cada 18 min; 3 fallos ~= 54 min de
- * silencio antes de re-unirse (robusto ante un -111 puntual de duty-cycle). */
-#define LINK_KEEPALIVE_EVERY  6
+ *
+ * OJO AL CALIBRARLO: estos numeros se cuentan en ENVIOS, no en minutos, asi
+ * que dependen de LORA_SEND_PERIOD_S. Cuando el periodo subio de 180 a 720 s
+ * estas constantes se quedaron sin tocar y los tiempos reales se fueron a 4x
+ * (sondeo cada 72 min, caida declarada a las 3 h 36 min). Con N=2 y periodo
+ * 720 s se sondea cada 24 min y 3 fallos ~= 72 min de silencio antes de
+ * re-unirse, que es robusto ante un -111 puntual de duty-cycle. Si vuelves a
+ * mover LORA_SEND_PERIOD_S, rehaz la cuenta y ajusta tambien el umbral verde
+ * del panel (portal_html.c, funcion L()). */
+#define LINK_KEEPALIVE_EVERY  2
 #define LINK_MAX_FAILS        3
 
 /* =======================================================================
@@ -143,6 +154,31 @@ static void i2c1_scan(void)
 #define JOIN_RETRY_PERIOD_S   300
 
 /* =======================================================================
+ *  MODO PRUEBA: CICLADO RAPIDO DEL SOFTAP   <-- PONER A 0 EN PRODUCCION
+ * =======================================================================
+ * Con un valor > 0 se IGNORA la franja horaria y el AP se enciende y se apaga
+ * cada AP_CYCLE_TEST_S segundos.
+ *
+ * Existe porque la franja nocturna real solo cruza una frontera al dia, y el
+ * nodo dejo de transmitir el 2026-09-09 a las 19:08 — ocho minutos despues de
+ * que se abriera la ventana de las 19:00 — sin que nadie lo tocara. Esperar a
+ * la noche siguiente para ver si se repite es inviable, asi que esto ejerce el
+ * MISMO camino de codigo (net_mgmt AP_DISABLE + enable_softap + apply_ap_ip,
+ * con HTTP/DNS/DHCP vivos encima del interfaz) muchas veces por minuto y en
+ * las DOS direcciones.
+ *
+ * Si el nodo aguanta un buen rato ciclando, la franja del AP queda descartada
+ * como causa y hay que buscar en otro lado. Si se cae, el panic handler deja
+ * el backtrace en el puerto serie.
+ *
+ * NO DEJAR ACTIVO: el ciclado constante de la radio WiFi no es un modo de
+ * funcionamiento valido, solo un banco de pruebas. */
+/* Se puso a 60 el 2026-09-10 para descartar la franja del AP como causa de la
+ * parada del 2026-09-09 a las 19:08. Resultado: 13 ciclos completos de
+ * encendido/apagado sin un solo cuelgue -> DESCARTADA. Vuelve a 0. */
+#define AP_CYCLE_TEST_S       0
+
+/* =======================================================================
  *  CANALES (FPorts) — cada tipo de mensaje va por su PROPIO FPort, para
  *  poder enrutarlos/actuar por separado en ChirpStack.
  * ======================================================================= */
@@ -160,7 +196,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0205   /* v2.5 — incidencia FPort 3 + sensores sin LoRa */
+#define FW_VERSION    0x0206   /* v2.6 — el verde del portal exige prueba de enlace */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -464,7 +500,7 @@ static void health_update(struct sensor_health *h, bool ok, uint8_t bit,
  * apagado? La ventana puede cruzar medianoche (19 -> 6). Si los dos extremos
  * son iguales, la funcion queda desactivada y el AP no se apaga nunca.
  */
-static bool ap_in_off_window(uint8_t hour)
+__maybe_unused static bool ap_in_off_window(uint8_t hour)
 {
 	if (AP_OFF_FROM_H == AP_OFF_TO_H) {
 		return false;
@@ -500,6 +536,13 @@ static void downlink_cb(uint8_t port, uint8_t flags, int16_t rssi,
                         int8_t snr, uint8_t len, const uint8_t *data)
 {
     printk("DL port=%d rssi=%d snr=%d len=%d\n", port, rssi, snr, len);
+
+    /* PRUEBA DE ENLACE. Un downlink solo puede llegar en la ventana RX1/RX2
+       que abre un uplink NUESTRO: si el servidor nos contesta es que ese
+       uplink llego. Es la evidencia mas barata que tenemos (no cuesta ni un
+       byte de airtime) y la unica que llega entre keepalives, asi que se
+       apunta aqui para el indicador del portal. */
+    portal_set_lora(true, true);
 
     /* Downlinks en el FPort del portal -> protocolo de actualizacion de HTML.
        Reensambla por trozos (BEGIN/DATA/COMMIT) y valida CRC antes de aplicar. */
@@ -692,7 +735,11 @@ int main(void)
                "(reintento de join cada %d s)\n",
                JOIN_BOOT_ATTEMPTS, JOIN_RETRY_PERIOD_S);
     }
-    portal_set_lora(joined, false);
+    /* Un join OK significa que el servidor recibio nuestro JoinRequest y que
+       nosotros recibimos su JoinAccept: enlace probado en ambos sentidos. No
+       hay razon para arrancar en ambar ("unido, sin envios aun") durante los
+       12 min que faltan hasta el primer uplink. */
+    portal_set_lora(joined, joined);
 
     /*
      * Payload LoRaWAN v2 (29 bytes, little-endian, FPort 2).
@@ -1058,7 +1105,7 @@ int main(void)
             if (jr == 0) {
                 joined = true;
                 printk("JOIN OK tras reintento: LoRa operativo\n");
-                portal_set_lora(true, false);
+                portal_set_lora(true, true);   /* JoinAccept = enlace probado */
             } else {
                 printk("JOIN reintento ERR: %d (otro en %d s)\n",
                        jr, JOIN_RETRY_PERIOD_S);
@@ -1103,7 +1150,14 @@ int main(void)
          * el driver falla, asi que llamarla en cada ciclo reintenta sola una
          * reactivacion fallida — que es el escenario grave (AP que no vuelve).
          */
-        bool ap_should_be_on = !have_time || !ap_in_off_window(lt.hour);
+        bool ap_should_be_on;
+#if AP_CYCLE_TEST_S > 0
+        /* MODO PRUEBA (ver AP_CYCLE_TEST_S): media onda cuadrada sobre el
+           uptime, encendido el primer periodo y apagado el segundo. */
+        ap_should_be_on = (((now / 1000) / AP_CYCLE_TEST_S) % 2) == 0;
+#else
+        ap_should_be_on = !have_time || !ap_in_off_window(lt.hour);
+#endif
         (void)portal_ap_set(ap_should_be_on);
 
         /* Rate-of-rise termico (EN 54-5): mete (now, temp) en la ventana
@@ -1295,8 +1349,15 @@ int main(void)
                 printk("SEND OK\n");
             }
             /* Al indicador del portal: 'joined' sigue siendo cierto aunque
-               este envio fallase; lo que cambia es la marca de ultimo OK. */
-            portal_set_lora(true, ret == 0);
+               este envio fallase; lo que cambia es la marca de ultimo OK.
+               Y esa marca SOLO la mueve un keepalive CONFIRMED con ACK: el
+               ret==0 de un UNCONFIRMED significa "he transmitido", no "me han
+               oido" (ver SUPERVISION DEL ENLACE arriba). Marcarlo con cada
+               envio dejaba el indicador en verde permanente, porque el
+               periodo de envio (720 s) es menor que el umbral de caducidad
+               del panel: cada uplink al vacio rearmaba el temporizador antes
+               de que llegase a expirar. */
+            portal_set_lora(true, keepalive && ret == 0);
             last_send_ms = now;
             memset(&acc, 0, sizeof(acc));   /* nueva ventana de promediado */
 
@@ -1322,7 +1383,7 @@ int main(void)
                             if (jr == 0) {
                                 printk("REJOIN OK (intento %d)\n", a);
                                 joined = true;
-                                portal_set_lora(true, false);
+                                portal_set_lora(true, true);   /* JoinAccept = enlace probado */
                                 break;
                             }
                             printk("REJOIN ERR %d (intento %d/%d)\n", jr, a,

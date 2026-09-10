@@ -50,13 +50,16 @@ void portal_get_sensors(struct portal_sensors *out)
  * mismo mutex que la snapshot: son dos valores que se leen juntos y no vale
  * la pena un segundo candado. */
 static bool    lora_joined;
-static int64_t lora_last_ok_ms;   /* uptime del ultimo envio OK, 0 = ninguno */
+static int64_t lora_last_ok_ms;   /* uptime de la ultima PRUEBA de enlace, 0 = ninguna */
 
-void portal_set_lora(bool joined, bool send_ok)
+/* 'link_proof' es prueba de que alguien nos oyo, no de que hayamos
+ * transmitido: ver la nota en portal.h. Quien llama es responsable de no
+ * pasar true por un simple ret==0 de un uplink UNCONFIRMED. */
+void portal_set_lora(bool joined, bool link_proof)
 {
 	k_mutex_lock(&snapshot_lock, K_FOREVER);
 	lora_joined = joined;
-	if (send_ok) {
+	if (link_proof) {
 		lora_last_ok_ms = k_uptime_get();
 	}
 	k_mutex_unlock(&snapshot_lock);

@@ -329,6 +329,69 @@ No hay anulación manual, así que las tres reglas importan:
 
 ---
 
+## 5 ter. Supervisión del enlace y el indicador del portal
+
+```c
+#define LINK_KEEPALIVE_EVERY  2   // 1 de cada N envíos de datos va CONFIRMED
+#define LINK_MAX_FAILS        3   // keepalives seguidos sin ACK -> REJOIN
+```
+
+### El problema: "SEND OK" no significa que llegue
+
+`lorawan_send()` con `LORAWAN_MSG_UNCONFIRMED` devuelve `0` en cuanto el
+transceptor **termina de transmitir** — lo decide el `mcps_confirm` del TX, en
+`zephyr/subsys/lorawan/loramac-node/lorawan.c:726`. Sin gateway, fuera de
+cobertura o con la antena desconectada devuelve `0` igual. Un nodo puede pasar
+días gritando al vacío e imprimiendo `SEND OK` en cada ciclo.
+
+### Las tres únicas pruebas de que el enlace está vivo
+
+Todas significan lo mismo: **alguien nos ha oído**.
+
+| Prueba | Coste | Frecuencia |
+|---|---|---|
+| ACK de un uplink **CONFIRMED** (keepalive) | un downlink del servidor | 1 de cada `LINK_KEEPALIVE_EVERY` envíos |
+| Cualquier **downlink** recibido | gratis (viaja en la ventana RX de un uplink nuestro) | cuando el servidor tenga algo que decir |
+| Un **join / rejoin** OK | ~2 uplinks | al arrancar o al recuperarse |
+
+Un downlink solo puede llegar en la ventana RX1/RX2 que abre un uplink
+nuestro: si el servidor contesta, ese uplink llegó.
+
+### Tiempos que salen de ahí
+
+Con `LORA_SEND_PERIOD_S = 720` y `LINK_KEEPALIVE_EVERY = 2`:
+
+- **Sondeo del enlace:** cada 2 × 720 s = **24 min**
+- **Enlace declarado caído** (`LINK_MAX_FAILS = 3`) → REJOIN: **~72 min**
+- Si el rejoin tampoco entra, `joined = false`: el nodo **deja de transmitir**
+  y pasa al reintento de join cada `JOIN_RETRY_PERIOD_S`.
+
+> Estas constantes se cuentan en **envíos, no en minutos**. Si mueves
+> `LORA_SEND_PERIOD_S`, los tiempos reales se mueven con él y hay que rehacer
+> la cuenta — incluido el umbral del panel, más abajo.
+
+### El indicador del portal
+
+El punto junto al título del panel (y el color del propio título):
+
+| Color | Significa | Condición |
+|---|---|---|
+| 🟢 verde | enlace probado hace poco | `lora=true` y última prueba < **50 min** |
+| 🟠 ámbar | unido, pero nadie contesta | `lora=true` y prueba más vieja (o ninguna) |
+| 🔴 rojo | sin red LoRa | `lora=false` (join fallido o enlace declarado caído) |
+
+El umbral de 50 min es **2 × el sondeo del keepalive**, con margen para que un
+`-111` puntual de duty-cycle no lo dispare. Vive en `src/portal/portal_html.c`,
+función `L()`.
+
+Lo que el verde **no** significa: que hayamos transmitido. Mientras el
+indicador se alimentó del `ret == 0` de los uplinks UNCONFIRMED, un nodo fuera
+de cobertura se pintaba verde indefinidamente — cada uplink al vacío rearmaba
+el temporizador (720 s) antes de que caducara el umbral de entonces (900 s),
+justo en el caso en el que uno mira el indicador. Corregido en FW `0x0206`.
+
+---
+
 ## 6. El límite que manda: duty-cycle EU868 (1 %)
 
 Aunque leas cada 5 s, no se puede transmitir tan seguido. EU868 permite ocupar
@@ -364,6 +427,7 @@ Detalle completo (tabla por SF, condiciones) en
 | Cambiar un canal | `FPORT_DATA/INCID/ALERT` | `src/main.c` (bloque *CANALES*) |
 | Ajustar cuándo salta una alerta | `TH_*_MAX/MIN`, `TH_*_EN` | `src/main.c` (bloque *UMBRALES*) |
 | Evitar alertas repetidas | `TH_HYSTERESIS_PCT`, `ALERT_MIN_INTERVAL_S` | íd. |
+| Detectar antes/después un enlace muerto | `LINK_KEEPALIVE_EVERY`, `LINK_MAX_FAILS` | `src/main.c` (bloque *SUPERVISION DEL ENLACE*) + umbral de `L()` en `src/portal/portal_html.c` |
 
 > Regla de oro: baja `LORA_SEND_PERIOD_S` con cuidado. Por debajo de ~215 s
 > puede salir `-111` mientras el ADR no haya bajado el SF; con ADR estable a SF7,

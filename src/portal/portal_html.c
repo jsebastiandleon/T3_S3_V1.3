@@ -63,8 +63,13 @@ LOG_MODULE_REGISTER(portal_html, LOG_LEVEL_INF);
  *
  * INDICADOR DE LORA: SOLO COLOR, sin una palabra en pantalla. Lo dicen el
  * color del titulo y el puntito que lo acompana:
- *     verde  unido y enviando        ambar  unido pero sin envios recientes
- *     rojo   sin red LoRa            gris   aun sin saberlo
+ *     verde  enlace probado hace poco    ambar  unido, pero nadie contesta
+ *     rojo   sin red LoRa                gris   aun sin saberlo
+ * "Probado" es literal: verde significa que alguien nos ha OIDO (ACK de un
+ * keepalive, un downlink o un join), no que hayamos transmitido. La
+ * distincion no es teorica: mientras el verde se alimentaba del ret==0 de
+ * los uplinks UNCONFIRMED, un nodo fuera de cobertura se pintaba verde para
+ * siempre, que es justo el caso en que hay que mirar el indicador.
  * Tocando el puntito, el subtitulo cuenta el detalle unos segundos (es la
  * unica via textual, y hay que buscarla: el estado de la radio le importa a
  * quien mantiene el nodo, no al vecino que abre el portal a mirar el aire).
@@ -260,15 +265,20 @@ static const char default_html[] =
 	/* K(): confirmado. Lanza el aviso al servidor y devuelve true para que el
 	 * <a href="tel:"> siga su curso y abra el marcador. */
 	"function K(){if(!P)return false;var p=P;C();A(p.a,p.n);return true;}"
-	/* L(): estado de la radio -> COLOR del titulo y del punto, nada mas. Ambar
-	 * = unido pero sin envio OK en 15 min, mas de lo que tarda un ciclo
-	 * normal. Sin LoRa la pagina sigue mostrando sensores: esto solo informa,
-	 * y por eso no gasta ni una linea de texto en pantalla. */
+	/* L(): estado de la radio -> COLOR del titulo y del punto, nada mas.
+	 * Ambar = unido pero sin PRUEBA de enlace en 50 min. El umbral es 2x el
+	 * sondeo del keepalive (LINK_KEEPALIVE_EVERY=2 x 720 s = 24 min), con
+	 * margen para que un -111 puntual de duty-cycle no lo dispare; el
+	 * firmware declara el enlace caido a los ~72 min y entonces esto pasa a
+	 * rojo por 'lora'=false. Si cambia LORA_SEND_PERIOD_S o el keepalive en
+	 * main.c, este numero va detras. Sin LoRa la pagina sigue mostrando
+	 * sensores: esto solo informa, y por eso no gasta ni una linea de texto
+	 * en pantalla. */
 	"function L(d){var m=d.lora_ms,k;"
 	"if(!d.lora){k='loff';LT='sin red LoRa (los sensores siguen midiendo)';}"
-	"else if(m<0){k='lwarn';LT='LoRa unido, sin envios aun';}"
-	"else{k=(m<900000)?'lon':'lwarn';"
-	"LT='LoRa unido, ultimo envio hace '+Math.round(m/1000)+' s';}"
+	"else if(m<0){k='lwarn';LT='LoRa unido, sin respuesta de la red aun';}"
+	"else{k=(m<3000000)?'lon':'lwarn';"
+	"LT='LoRa unido, red confirmada hace '+Math.round(m/60000)+' min';}"
 	"$('ld').className='led '+k;$('hd').className=k;}"
 	/* GS(): la resistencia del MOX sube con aire limpio y baja con gases, de
 	 * forma LOGARITMICA. Se mapea 5 kOhm (saturado) a 500 kOhm (limpio) sobre

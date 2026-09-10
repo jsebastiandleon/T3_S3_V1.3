@@ -100,11 +100,19 @@ bool portal_take_incident(uint8_t *source, uint16_t *count);
  * vecino que abre el portal, es para quien mantiene el nodo. Por eso hace
  * falta publicar el estado aqui.
  *
- * 'joined'  = la pila LoRaWAN completo el join.
- * 'last_ok' = uptime del ultimo uplink que salio sin error (0 = ninguno aun).
- *             Sirve para distinguir "unido pero mudo" de "unido y enviando",
- *             que es la diferencia que importa cuando algo va mal. */
-void portal_set_lora(bool joined, bool send_ok);
+ * 'joined'     = la pila LoRaWAN completo el join.
+ * 'link_proof' = este instante trae PRUEBA de que el enlace esta vivo. No
+ *                vale "el uplink salio sin error": un UNCONFIRMED devuelve 0
+ *                aunque no lo oiga nadie. Solo son prueba tres cosas, y las
+ *                tres significan que alguien nos escucho:
+ *                  - ACK de un uplink CONFIRMED (keepalive),
+ *                  - cualquier downlink recibido (viaja en la ventana RX de
+ *                    un uplink nuestro, luego ese uplink llego),
+ *                  - un join/rejoin OK (JoinRequest oido + JoinAccept nuestro).
+ *                Sirve para distinguir "unido pero gritando al vacio" de
+ *                "unido y con alguien al otro lado", que es la diferencia que
+ *                importa cuando algo va mal. */
+void portal_set_lora(bool joined, bool link_proof);
 void portal_get_lora(bool *joined, int64_t *last_ok_age_ms);
 
 /* ---- HTML mutable del portal -------------------------------------------- */
