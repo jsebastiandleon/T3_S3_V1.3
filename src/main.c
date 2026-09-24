@@ -196,7 +196,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0209   /* v2.9 — FPort 4 con validez y nivel de umbral */
+#define FW_VERSION    0x020A   /* v2.10 — temperatura de respaldo del SEN65 */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -386,6 +386,12 @@ static void i2c1_scan(void)
 #define ALERT_GAS      0x20
 #define ALERT_HEAT_ROR 0x40   /* subida rapida de temperatura (EN 54-5)        */
 #define ALERT_FIRE     0x80   /* FUEGO confirmado multicriterio (EN 54-30/31)  */
+
+/* Bit EXTRA del byte valid_mask del FPort 4 (los bits 0/1/3 de ese byte son
+   los del FPort 2: que sensor leyo bien). Marca que el campo de temperatura
+   NO viene del BM688 sino del respaldo del SEN65, para que el servidor sepa
+   que termometro esta leyendo. La temperatura es valida si bit0 O bit6. */
+#define VALID_TEMP_BACKUP  0x40
 
 /* =======================================================================
  *  SALUD DEL NODO: causa de reset + contador de arranques  (FPORT_DIAG)
@@ -801,6 +807,10 @@ int main(void)
      *                              bit1 ZE15-CO, bit3 SEN65. El campo de un
      *                              sensor con el bit a 0 va a 0 y NO es una
      *                              medida: es "sin dato".
+     *                              bit6 (VALID_TEMP_BACKUP) = la temperatura
+     *                              viene del SEN65, no del BM688 (respaldo).
+     *                              -> la temperatura es valida si bit0 O bit6;
+     *                                 el gas solo si bit0.
      *   [16]    uint8  active_mask — QUE UMBRALES ESTABAN POR ENCIMA en ese
      *                              instante (NIVEL), frente a alert_mask, que
      *                              es el FLANCO (lo que cruzo justo entonces).
@@ -985,6 +995,8 @@ int main(void)
     int64_t ror_ms[ROR_N];
     double  ror_temp[ROR_N];
     int     ror_count = 0;
+    int     ror_src   = 0;   /* que termometro llena la ventana: 0 ninguno,
+                                1 BM688, 2 SEN65 (respaldo). Ver mas abajo. */
 
     while (1) {
         /* Aviso de incidencia: alguien ha tocado un telefono en el portal
@@ -1039,9 +1051,10 @@ int main(void)
             }
         }
 
-        ps.bm688_valid = false;
-        ps.co_valid    = false;
-        ps.sen65_valid = false;
+        ps.bm688_valid      = false;
+        ps.co_valid         = false;
+        ps.sen65_valid      = false;
+        ps.sen65_temp_valid = false;
 
         /* BM688 (si esta presente): suma al acumulador + snapshot al portal. */
         if (bm688_dev != NULL) {
@@ -1125,6 +1138,12 @@ int main(void)
                 ps.nox_index   = ad.nox_index;
                 ps.sen65_temp  = ad.temperature;
                 ps.sen65_hum   = ad.humidity;
+                /* El 0.0 de un canal "desconocido" es relleno, no una medida:
+                   si se colase en la ventana del rate-of-rise, el salto de
+                   0.0 a la siguiente lectura real se leeria como una subida
+                   de decenas de C/min -> falsa alarma de calor, y con humo o
+                   CO delante, un FUEGO confirmado. */
+                ps.sen65_temp_valid = (ad.unknown & SEN6X_UNK_TEMP) == 0U;
             } else {
                 printk("SEN65 READ ERR: %d\n", ar);
             }
@@ -1204,21 +1223,74 @@ int main(void)
 #endif
         (void)portal_ap_set(ap_should_be_on);
 
+        /* =============================================================
+         *  TEMPERATURA PARA LA DETECCION TERMICA (primaria + respaldo)
+         * =============================================================
+         * El nodo lleva DOS termometros: el del BM688 y el del SEN65. Hasta
+         * la v2.9 toda la deteccion termica colgaba solo del BM688, asi que
+         * un BM688 averiado apagaba en silencio el umbral fijo, el
+         * rate-of-rise y la familia CALOR del criterio de FUEGO — con un
+         * termometro perfectamente vivo al lado. Es justo lo que pasa en los
+         * nodos 2444 y 2284. El portal ya hacia este respaldo para pintar;
+         * ahora tambien lo hace la deteccion.
+         *
+         * El BM688 sigue siendo la fuente PRIMARIA: esta pensado para medir
+         * ambiente, mientras que el SEN65 mide su propio die con un
+         * ventilador y un laser dentro del modulo. El respaldo es peor que el
+         * primario, pero infinitamente mejor que no vigilar.
+         *
+         * OJO CALIBRACION: cada fuente tiene su propio offset
+         * (TEMP_OFFSET_BM688_C / TEMP_OFFSET_SEN65_C), ya aplicado antes de
+         * llegar aqui. Si solo se ha calibrado el BM688, el umbral fijo de
+         * 58 C sobre el respaldo arrastra el sesgo del SEN65. */
+        double fire_temp        = 0.0;
+        bool   fire_temp_ok     = false;
+        bool   fire_temp_backup = false;
+
+        if (ps.bm688_valid) {
+            fire_temp    = ps.temperature;
+            fire_temp_ok = true;
+        } else if (ps.sen65_valid && ps.sen65_temp_valid) {
+            fire_temp        = ps.sen65_temp;
+            fire_temp_ok     = true;
+            fire_temp_backup = true;
+        }
+
         /* Rate-of-rise termico (EN 54-5): mete (now, temp) en la ventana
            deslizante y calcula el ritmo en C/min entre la muestra mas antigua
-           y la actual. Solo con dato fresco del BM688. */
+           y la actual. Usa la fuente elegida arriba. */
         double temp_ror_cpmin = 0.0;
         bool   ror_ready = false;
-        if (ps.bm688_valid) {
+        if (fire_temp_ok) {
+            /* Las dos fuentes NO miden lo mismo: cada una lee su propio die,
+               con autocalentamiento y offset distintos. Mezclarlas en la
+               misma ventana meteria un ESCALON de varios grados que el
+               rate-of-rise interpretaria como una subida real -> falsa alarma
+               de fuego justo en el momento en que un sensor se avería. Al
+               cambiar de termometro se tira la ventana y se empieza de cero.
+               Un HUECO de la misma fuente (una lectura fallida suelta) NO
+               resetea: las marcas de tiempo hacen que el ritmo siga siendo
+               correcto sobre una ventana mas larga. */
+            int src = fire_temp_backup ? 2 : 1;
+
+            if (src != ror_src) {
+                if (ror_src != 0) {
+                    printk("ROR: cambio de termometro (%s) -> ventana reiniciada\n",
+                           src == 2 ? "BM688 -> SEN65" : "SEN65 -> BM688");
+                }
+                ror_count = 0;
+                ror_src   = src;
+            }
+
             if (ror_count < ROR_N) {
                 ror_ms[ror_count]   = now;
-                ror_temp[ror_count] = ps.temperature;
+                ror_temp[ror_count] = fire_temp;
                 ror_count++;
             } else {
                 memmove(ror_ms,   ror_ms + 1,   (ROR_N - 1) * sizeof(ror_ms[0]));
                 memmove(ror_temp, ror_temp + 1, (ROR_N - 1) * sizeof(ror_temp[0]));
                 ror_ms[ROR_N - 1]   = now;
-                ror_temp[ROR_N - 1] = ps.temperature;
+                ror_temp[ROR_N - 1] = fire_temp;
             }
             if (ror_count >= ROR_N) {
                 double dt_min = (double)(ror_ms[ROR_N - 1] - ror_ms[0]) / 60000.0;
@@ -1274,7 +1346,7 @@ int main(void)
             }                                                                 \
         } while (0)
 
-        TH_CHECK_MAX(TH_TEMP_EN, ps.bm688_valid, ps.temperature,    TH_TEMP_MAX, ALERT_TEMP);
+        TH_CHECK_MAX(TH_TEMP_EN, fire_temp_ok,   fire_temp,         TH_TEMP_MAX, ALERT_TEMP);
         TH_CHECK_MAX(TH_CO_EN,   ps.co_valid,     ps.co_ppm,         TH_CO_MAX,   ALERT_CO);
         TH_CHECK_MAX(TH_PM25_EN, ps.sen65_valid,  ps.pm2_5,          TH_PM25_MAX, ALERT_PM25);
         TH_CHECK_MAX(TH_PM10_EN, ps.sen65_valid,  ps.pm10_0,         TH_PM10_MAX, ALERT_PM10);
@@ -1311,16 +1383,21 @@ int main(void)
             /* Un sensor en fallo NO tiene valor que contar: su campo va a 0 y
                su bit se cae de valid_mask, igual que hace el FPort 2. Copiarlo
                a ciegas es lo que emitia lecturas fantasma (CO=6553.5 ppm). */
-            alert.temp_cdeg  = ps.bm688_valid ? (int16_t)(ps.temperature * 100.0) : 0;
+            /* La temperatura que viaja es LA QUE SE EVALUO (primaria o
+               respaldo), no siempre la del BM688: si no, una alerta termica
+               disparada por el SEN65 llegaria con el campo a 0. El gas sigue
+               siendo exclusivo del BM688. */
+            alert.temp_cdeg  = fire_temp_ok   ? (int16_t)(fire_temp * 100.0)      : 0;
             alert.gas_ohm    = ps.bm688_valid ? (uint32_t)ps.gas_resistance       : 0;
             alert.co_ppm_x10 = ps.co_valid    ? (uint16_t)(ps.co_ppm * 10.0)      : 0;
             alert.pm2_5_x10  = ps.sen65_valid ? (uint16_t)(ps.pm2_5 * 10.0)       : 0;
             alert.pm10_0_x10 = ps.sen65_valid ? (uint16_t)(ps.pm10_0 * 10.0)      : 0;
             alert.voc_x10    = ps.sen65_valid ? (uint16_t)(ps.voc_index * 10.0)   : 0;
 
-            alert.valid_mask = (ps.bm688_valid ? FLAG_BM688_OK : 0) |
-                               (ps.co_valid    ? FLAG_CO_OK    : 0) |
-                               (ps.sen65_valid ? FLAG_SEN65_OK : 0);
+            alert.valid_mask = (ps.bm688_valid   ? FLAG_BM688_OK     : 0) |
+                               (ps.co_valid      ? FLAG_CO_OK        : 0) |
+                               (ps.sen65_valid   ? FLAG_SEN65_OK     : 0) |
+                               (fire_temp_backup ? VALID_TEMP_BACKUP : 0);
 
             /* NIVEL del mismo instante que los valores: se captura aqui, no al
                enviar, para que toda la trama describa UN solo momento (el

@@ -100,7 +100,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			"{\"bm688\":%s,\"temperature\":%d.%02d,\"humidity\":%d.%02d,"
 			"\"pressure\":%d,\"gas\":%d,"
 			"\"co\":%s,\"co_ppm\":%d.%d,"
-			"\"sen65\":%s,\"pm1_0\":%d.%d,\"pm2_5\":%d.%d,"
+			"\"sen65\":%s,\"s_temp_ok\":%s,\"pm1_0\":%d.%d,\"pm2_5\":%d.%d,"
 			"\"pm4_0\":%d.%d,\"pm10_0\":%d.%d,\"voc\":%d,\"nox\":%d,"
 			"\"s_temp\":%d.%02d,\"s_hum\":%d.%02d,"
 			"\"lora\":%s,\"lora_ms\":%lld,"
@@ -109,6 +109,7 @@ static int sensors_handler(struct http_client_ctx *client,
 			(int)s.pressure, (int)s.gas_resistance,
 			s.co_valid ? "true" : "false", co_i, co_f,
 			s.sen65_valid ? "true" : "false",
+			s.sen65_temp_valid ? "true" : "false",
 			p1_i, p1_f, p25_i, p25_f, p4_i, p4_f, p10_i, p10_f,
 			(int)s.voc_index, (int)s.nox_index,
 			st_i, st_f, sh_i, sh_f,

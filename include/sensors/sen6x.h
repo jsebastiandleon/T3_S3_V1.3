@@ -27,6 +27,7 @@
 #define INCLUDE_SENSORS_SEN6X_H
 
 #include <zephyr/device.h>
+#include <stdint.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -43,17 +44,35 @@ extern "C" {
  *  - nox_index                   : indice NOx (1..500 tipico; 0 hasta converger)
  *
  * Cualquier canal cuyo valor "desconocido" reporte el sensor (0xFFFF / 0x7FFF)
- * se entrega como 0.0 para no propagar valores centinela.
+ * se entrega como 0.0 para no propagar valores centinela, Y su bit queda
+ * marcado en 'unknown'. Ese 0.0 es RELLENO, no una medida: quien use el valor
+ * para algo que dependa de su magnitud (umbrales, diferencias entre muestras)
+ * debe consultar antes 'unknown'.
+ *
+ * El caso que obliga a distinguirlo: el rate-of-rise termico mide la
+ * DIFERENCIA entre muestras de una ventana. Un 0.0 de relleno seguido de una
+ * lectura real de 25 C se lee como una subida de +25 C/min y dispara la
+ * alarma de calor — y con humo o CO presentes, un FUEGO confirmado.
  */
+#define SEN6X_UNK_PM1_0   0x01
+#define SEN6X_UNK_PM2_5   0x02
+#define SEN6X_UNK_PM4_0   0x04
+#define SEN6X_UNK_PM10_0  0x08
+#define SEN6X_UNK_HUM     0x10
+#define SEN6X_UNK_TEMP    0x20
+#define SEN6X_UNK_VOC     0x40
+#define SEN6X_UNK_NOX     0x80
+
 struct sen6x_data {
-	double pm1_0;
-	double pm2_5;
-	double pm4_0;
-	double pm10_0;
-	double humidity;
-	double temperature;
-	double voc_index;
-	double nox_index;
+	double  pm1_0;
+	double  pm2_5;
+	double  pm4_0;
+	double  pm10_0;
+	double  humidity;
+	double  temperature;
+	double  voc_index;
+	double  nox_index;
+	uint8_t unknown;   /* bits SEN6X_UNK_*: canales sin medida real */
 };
 
 /**

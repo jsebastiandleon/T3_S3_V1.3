@@ -101,7 +101,7 @@ configurado (flanco de subida). No se reenvía hasta que el valor baje del umbra
 | 7–8 | uint16 | PM10 | ÷10 → µg/m³ |
 | 9–10 | uint16 | VOC index | ÷10 |
 | 11–14 | uint32 | gas resistance | → Ω |
-| 15 | uint8 | **valid_mask** | qué sensor respalda cada valor: bit0 BM688 · bit1 ZE15-CO · bit3 SEN65 (mismos bits que el byte 0 del FPort 2) |
+| 15 | uint8 | **valid_mask** | qué sensor respalda cada valor: bit0 BM688 · bit1 ZE15-CO · bit3 SEN65 (mismos bits que el byte 0 del FPort 2) · **bit6 = la temperatura viene del SEN65 (respaldo), no del BM688** |
 | 16 | uint8 | **active_mask** | qué umbrales estaban **por encima** en ese instante (mismos bits que `alert_mask`) |
 
 Los bytes **15 y 16 se añaden al final** en la v2.9: los offsets 0–14 no se
@@ -120,6 +120,19 @@ Caso real: PM2.5 = 433 µg/m³ llevaba rato alto (ya había disparado) y el PM10
 cruzó los 150 por primera vez. `alert_mask` marcaba **solo PM10**, que es
 correcto pero parecía un fallo. Con `active_mask` se ve que **ambos** estaban
 altos. Para pintar estado usar `active_mask`; para el evento, `alert_mask`.
+
+**Temperatura: dos fuentes.** El nodo tiene dos termómetros. Desde la **v2.10**
+la detección térmica usa el del BM688 como primaria y **cae a la del SEN65** si
+el BM688 falla, en vez de apagarse. Por eso:
+
+- `temperature_c` es válida si **bit0 O bit6**; `gas_resistance_ohm` solo si bit0.
+- El decoder expone `temperature_source`: `"bm688"`, `"sen65"` o `null`.
+- Con el respaldo activo el umbral fijo y el rate-of-rise **siguen vigilando**,
+  pero con el sesgo del SEN65 (mide su propio die, con ventilador y láser
+  dentro del módulo). Si solo se ha calibrado `TEMP_OFFSET_BM688_C`, el umbral
+  de 58 °C sobre el respaldo arrastra ese sesgo.
+- Una trama **legacy de 15 B** (≤ v2.8) no tiene este bit: ahí la temperatura
+  siempre es del BM688.
 
 **`valid_mask` distingue "0" de "sin dato".** El campo de un sensor cuyo bit
 está a 0 vale 0 pero **no es una medida**; el decoder lo devuelve como `null`.

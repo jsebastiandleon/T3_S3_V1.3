@@ -122,19 +122,25 @@ static int sen6x_read_words(uint16_t cmd, uint16_t *out, size_t n_words,
 	return 0;
 }
 
-/* uint16 -> double aplicando escala, mapeando el centinela "desconocido" a 0. */
-static double sen6x_scale_u16(uint16_t raw, double scale)
+/* uint16 -> double aplicando escala. Si el sensor devuelve el centinela
+   "desconocido" se entrega 0.0 y se marca 'bit' en *unknown, para que quien
+   lea sepa que ese 0.0 es relleno y no una medida. */
+static double sen6x_scale_u16(uint16_t raw, double scale, uint8_t bit,
+			      uint8_t *unknown)
 {
 	if (raw == SEN6X_UNKNOWN_U16) {
+		*unknown |= bit;
 		return 0.0;
 	}
 	return (double)raw / scale;
 }
 
-/* int16 -> double aplicando escala, mapeando el centinela "desconocido" a 0. */
-static double sen6x_scale_s16(uint16_t raw, double scale)
+/* int16 -> double, misma convencion que sen6x_scale_u16(). */
+static double sen6x_scale_s16(uint16_t raw, double scale, uint8_t bit,
+			      uint8_t *unknown)
 {
 	if (raw == SEN6X_UNKNOWN_S16) {
+		*unknown |= bit;
 		return 0.0;
 	}
 	return (double)((int16_t)raw) / scale;
@@ -211,14 +217,22 @@ int sen6x_read(const struct device *dev, struct sen6x_data *data)
 	 *   5    T   int16 /200  [C]
 	 *   6    VOC int16 /10   [indice]
 	 *   7    NOx int16 /10   [indice] */
-	data->pm1_0       = sen6x_scale_u16(w[0], 10.0);
-	data->pm2_5       = sen6x_scale_u16(w[1], 10.0);
-	data->pm4_0       = sen6x_scale_u16(w[2], 10.0);
-	data->pm10_0      = sen6x_scale_u16(w[3], 10.0);
-	data->humidity    = sen6x_scale_s16(w[4], 100.0);
-	data->temperature = sen6x_scale_s16(w[5], 200.0);
-	data->voc_index   = sen6x_scale_s16(w[6], 10.0);
-	data->nox_index   = sen6x_scale_s16(w[7], 10.0);
+	data->unknown = 0U;
+	data->pm1_0       = sen6x_scale_u16(w[0], 10.0,  SEN6X_UNK_PM1_0,  &data->unknown);
+	data->pm2_5       = sen6x_scale_u16(w[1], 10.0,  SEN6X_UNK_PM2_5,  &data->unknown);
+	data->pm4_0       = sen6x_scale_u16(w[2], 10.0,  SEN6X_UNK_PM4_0,  &data->unknown);
+	data->pm10_0      = sen6x_scale_u16(w[3], 10.0,  SEN6X_UNK_PM10_0, &data->unknown);
+	data->humidity    = sen6x_scale_s16(w[4], 100.0, SEN6X_UNK_HUM,    &data->unknown);
+	data->temperature = sen6x_scale_s16(w[5], 200.0, SEN6X_UNK_TEMP,   &data->unknown);
+	data->voc_index   = sen6x_scale_s16(w[6], 10.0,  SEN6X_UNK_VOC,    &data->unknown);
+	data->nox_index   = sen6x_scale_s16(w[7], 10.0,  SEN6X_UNK_NOX,    &data->unknown);
+
+	if (data->unknown != 0U) {
+		/* Normal durante el arranque (VOC/NOx tardan en converger) y
+		   sospechoso pasado ese rato: por eso se traza. */
+		LOG_WRN("SEN65: canales sin medida real, mascara 0x%02x",
+			data->unknown);
+	}
 
 	LOG_INF("SEN65 PM2.5=%d.%01d ug/m3 VOC=%d NOx=%d RH=%d%% T=%dC",
 		(int)data->pm2_5, (int)(data->pm2_5 * 10) % 10,

@@ -84,18 +84,32 @@ function decodeUplink(input) {
     var coOk  = (v & 0x02) !== 0;
     var senOk = (v & 0x08) !== 0;
 
+    // bit6 = la temperatura viene del SEN65, no del BM688. El nodo tiene dos
+    // termometros y desde v2.10 la deteccion termica cae al del SEN65 si el
+    // BM688 se avería, en vez de apagarse. La temperatura es valida si hay
+    // BM688 O respaldo; el gas es exclusivo del BM688.
+    // !legacy: en una trama de 15 B el comodin 0xFF encenderia este bit por
+    // accidente, y un nodo <= v2.8 no tiene respaldo — su temperatura siempre
+    // es la del BM688.
+    var tempBackup = !legacy && (v & 0x40) !== 0;
+    var tempOk     = bmOk || tempBackup;
+
     var out = {
       alert: fire ? "FIRE" : "THRESHOLD",   // FUEGO confirmado (multicriterio) vs umbral simple
       fire_confirmed: fire,                 // EN 54-30/31: coincidencia de >=2 familias
       triggered: bits(m),                   // FLANCO: que cruzo
       values: {
-        temperature_c:      bmOk  ? s16(1) / 100 : null,
-        co_ppm:             coOk  ? u16(3) / 10  : null,
-        pm2p5_ugm3:         senOk ? u16(5) / 10  : null,
-        pm10_ugm3:          senOk ? u16(7) / 10  : null,
-        voc_index:          senOk ? u16(9) / 10  : null,
-        gas_resistance_ohm: bmOk  ? u32(11)      : null
+        temperature_c:      tempOk ? s16(1) / 100 : null,
+        co_ppm:             coOk   ? u16(3) / 10  : null,
+        pm2p5_ugm3:         senOk  ? u16(5) / 10  : null,
+        pm10_ugm3:          senOk  ? u16(7) / 10  : null,
+        voc_index:          senOk  ? u16(9) / 10  : null,
+        gas_resistance_ohm: bmOk   ? u32(11)      : null
       },
+      // Que termometro ha producido temperature_c. Importa: el del SEN65 mide
+      // su propio die, con ventilador y laser dentro del modulo, asi que su
+      // sesgo no es el del BM688.
+      temperature_source: tempOk ? (tempBackup ? "sen65" : "bm688") : null,
       sensors_ok: { bm688: bmOk, ze15co: coOk, sen65: senOk },
       legacy_payload: legacy
     };
@@ -105,17 +119,33 @@ function decodeUplink(input) {
     }
 
     // Un sensor caido no solo deja un hueco: apaga los umbrales que dependen
-    // de el. Sin BM688 no hay temperatura fija, ni rate-of-rise, ni familia
-    // CALOR para el criterio de FUEGO -> la deteccion de ese nodo queda
-    // reducida. Que se vea en el JSON y no haya que deducirlo.
+    // de el, y esa perdida de cobertura es lo que hay que ver en el SCADA.
     var down = [];
     if (!bmOk)  { down.push("bm688"); }
     if (!coOk)  { down.push("ze15co"); }
     if (!senOk) { down.push("sen65"); }
+
+    var warn = [];
     if (down.length > 0) {
-      out.warnings = ["sensor sin lectura valida: " + down.join(", ") +
-                      " (sus umbrales no estan vigilando)"];
+      warn.push("sensor sin lectura valida: " + down.join(", "));
     }
+    if (tempBackup) {
+      // Degradado, no apagado: sigue habiendo vigilancia termica.
+      warn.push("temperatura en respaldo del SEN65 (BM688 caido): umbral " +
+                "termico y rate-of-rise SIGUEN activos, pero con el sesgo de " +
+                "ese sensor; la resistencia de gas no esta disponible");
+    }
+    if (!tempOk) {
+      warn.push("sin ninguna fuente de temperatura: umbral termico, " +
+                "rate-of-rise y familia CALOR del criterio de FUEGO apagados");
+    }
+    if (!senOk) {
+      warn.push("sin SEN65: familia HUMO (PM2.5/PM10) y VOC sin vigilar");
+    }
+    if (!coOk) {
+      warn.push("sin ZE15-CO: familia CO sin vigilar");
+    }
+    if (warn.length > 0) { out.warnings = warn; }
 
     return { data: out };
   }

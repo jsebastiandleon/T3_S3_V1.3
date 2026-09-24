@@ -38,6 +38,8 @@ struct portal_sensors {
 	double  voc_index;       /* indice VOC      */
 	double  nox_index;       /* indice NOx      */
 	double  sen65_temp;      /* grados C (SEN65)*/
+	bool    sen65_temp_valid;/* false = el SEN65 devolvio "desconocido" y
+				    sen65_temp es 0.0 de relleno, NO una medida */
 	double  sen65_hum;       /* %RH (SEN65)     */
 	int64_t updated_uptime_ms;
 };

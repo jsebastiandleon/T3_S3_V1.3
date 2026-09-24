@@ -310,7 +310,9 @@ static const char default_html[] =
 	"t.textContent=nm[i];t.style.background=Q[i];t.style.color='#0f172a';}"
 	"async function u(){try{var d=await(await fetch('/api/sensors')).json();"
 	/* Unifica temp/humedad: BM688 preferente, si no SEN65. */
-	"var tm=d.bm688?d.temperature:(d.sen65?d.s_temp:null);"
+	/* Respaldo del SEN65 SOLO si su canal de temperatura trae medida real:
+	   un centinela "desconocido" llega como 0.0 y pintaria 0 grados. */
+	"var tm=d.bm688?d.temperature:((d.sen65&&d.s_temp_ok)?d.s_temp:null);"
 	"var hm=d.bm688?d.humidity:(d.sen65?d.s_hum:null);"
 	"D('da',d.bm688||d.sen65);D('dq',d.co||d.sen65||d.bm688);L(d);"
 	"S('t',tm!=null?tm.toFixed(1):'--');"

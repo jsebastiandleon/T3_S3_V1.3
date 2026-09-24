@@ -238,6 +238,13 @@ medida instantánea, así reaccionan rápido.
 #define TH_GAS_EN   0 ; #define TH_GAS_MIN   10000.0// Ω  (MOX sin calibrar -> desactivado)
 ```
 
+**Fuente de la temperatura (desde v2.10):** primaria el BM688, respaldo el
+SEN65. Un BM688 averiado ya **no apaga** el umbral térmico, el rate-of-rise ni
+la familia *calor* del criterio de FUEGO — hasta la v2.9 sí lo hacía, en
+silencio y con un termómetro vivo al lado. Al cambiar de termómetro la ventana
+del rate-of-rise **se reinicia**: las dos fuentes tienen sesgos distintos y
+mezclarlas metería un escalón que se leería como una subida real.
+
 **Normas de incendio implementadas** (además de los umbrales fijos):
 
 - **EN 54-5 · rate-of-rise térmico** — dispara si la temperatura **sube rápido**
