@@ -50,14 +50,17 @@ aplicación, igual que el ZE15-CO.
  │ 5 GND  (NC)              │  │ │
  │ 6 VDD  (NC)              │  │ │
  └──────────────────────────┘  │ │
-                               4k7 4k7   ◄── pull-ups EXTERNOS OBLIGATORIOS
-                                │ │          (a 3V3; este bus NO es QWIIC, los
-                               3V3 3V3        pines pelados no los traen)
+                               4k7 4k7   ◄── OPCIONALES (a 3V3). El overlay
+                                │ │          activa los pull-ups INTERNOS del
+                               3V3 3V3        ESP32; bastan con cable corto.
 ```
 
-> ⚠️ **Bus propio I2C1, separado del BME688** (que está en I2C0/GPIO47-48). Al
-> ser pines de header pelado, SDA y SCL **necesitan pull-ups externos de 4.7k a
-> 3V3** (uno por línea). Las líneas SDA/SCL toleran 5 V, pero VDD es 3.3 V.
+> ⚠️ **Bus propio I2C1, separado del BME688** (que está en I2C0/GPIO47-48). El
+> pinctrl `i2c1_sen65` del overlay declara `bias-pull-up`, así que el bus usa los
+> **pull-ups internos** del ESP32-S3 (~45 kΩ): verificados suficientes a 100 kHz
+> con cable corto. Añade **4.7k externos a 3V3** solo si alargas el cable, si
+> cuelgas más dispositivos del bus o si aparecen errores de CRC.
+> Las líneas SDA/SCL toleran 5 V, pero VDD es 3.3 V.
 > Mantén el cable I2C corto (< 10 cm) y/o blindado para evitar errores de CRC.
 > Si el regulador 3V3 de la placa no cubre el pico de ~200 mA junto con
 > WiFi+LoRa, alimenta el SEN65 desde una fuente 3V3 externa **con GND común**.
@@ -71,7 +74,7 @@ aplicación, igual que el ZE15-CO.
 | Bus | **I2C1 propio** (GPIO15 SDA / GPIO16 SCL) | A petición: el SEN65 NO comparte pines con el BME688 (que sigue en I2C0/47-48). Segundo controlador I2C del ESP32-S3, libre. |
 | Pines | GPIO15/16 | Libres en este proyecto, sin función de strapping; enrutados a I2C1 por la GPIO matrix. |
 | Pinctrl | `i2c1_sen65` sobrescribe `i2c1_default` | El board enruta I2C1 a GPIO4/5 por defecto; se reasigna a 15/16. |
-| Pull-ups | **Externos 4.7k a 3V3** (obligatorios) | Bus nuevo en pines pelados (no QWIIC); sin pull-ups el bus no funciona. |
+| Pull-ups | **Internos del ESP32** (`bias-pull-up` en el overlay) | Suficientes a 100 kHz con cable corto. 4.7k externos solo si alargas el cable, añades dispositivos o ves errores de CRC. |
 | Velocidad | 100 kHz (heredada) | Es exactamente el máximo del SEN6x (standard mode). |
 | Driver | Wrapper de aplicación en C | No hay driver SEN6x nativo en Zephyr; se usa la API `i2c_*` directa. |
 | Resolución bus+dir | `I2C_DT_SPEC_GET` sobre nodo DT | Idiomático; el nodo del overlay aporta bus y `reg`. **Al estar `sen65` bajo `&i2c1`, el driver toma el bus correcto sin cambios en C.** |
@@ -220,9 +223,22 @@ SEN65 PM2.5=12.5 ug/m3 VOC=100 NOx=1 RH=53% T=27C
 
 Fallos posibles y su significado:
 - `SEN65 INIT ERR: -19` → bus I2C1 no listo (revisa overlay/Kconfig).
-- `SEN65 INIT ERR: -5` (no ACK en 0x6b) → revisa alimentación 3V3, GND común,
-  el par SDA(GPIO15)/SCL(GPIO16) y, sobre todo, los **pull-ups externos 4.7k**
-  (sin ellos el bus I2C1 no funciona).
+- `SEN65 INIT ERR: -5`, con `E: SEN65: no responde en 0x6b ...: -14` justo antes
+  → **el bus está bien; el problema está del cable para allá.** El `-14`
+  (`EFAULT`) es un **NACK limpio**: el driver `i2c_esp32` solo lo devuelve en
+  `I2C_STATUS_ACK_ERROR`, lo que significa que sacó los 9 pulsos de SCL y vio
+  SDA **en alto** durante el bit de ACK. Si faltaran pull-ups o hubiera un corto
+  saldría `-116` (`ETIMEDOUT`), no `-14`. Revisa, por este orden:
+  **1)** VDD en el conector del sensor = 3.15–3.45 V (⚠️ el ZE15-CO comparte
+  nodo y va a 5–12 V: equivocar el raíl puede dañar el SEN65, cuyo máximo
+  absoluto es 3.45 V); **2)** continuidad pin 3→GPIO15 y pin 4→GPIO16, que de
+  paso descarta el par cruzado y el cable suelto; **3)** GND común si lo
+  alimentas de una fuente aparte.
+  *No te fíes del ventilador:* solo arranca tras `Start Continuous Measurement`,
+  que no llegamos a enviar si el init falla, así que que no gire no prueba nada.
+- `sen6x_init()` se llama **una sola vez, en el arranque**. Si falla, el sensor
+  queda descartado hasta el siguiente reinicio: arreglar el cableado en caliente
+  no lo recupera.
 - `SEN65 READ ERR: -5` → CRC inválido en la respuesta (ruido / cable I2C largo /
   pull-ups demasiado débiles).
 
