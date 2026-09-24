@@ -1,7 +1,7 @@
 /*
  * ChirpStack v4 — Codec (Device Profile > Codec > JavaScript functions).
  * Decoder del nodo T3-S3 (BM688 + ZE15-CO + SEN65). Ver docs/PAYLOAD_DECODER.md.
- *   FPort 2 -> datos v2 (29 B)      FPort 4 -> alerta por umbral (15 B)
+ *   FPort 2 -> datos v2 (29 B)      FPort 4 -> alerta por umbral (17 B)
  *   FPort 3 -> aviso incidencia (4 B)  FPort 5 -> salud del nodo (13 B)
  *
  * DevEUI de pruebas: 1CDBD4FFFEBD2965
@@ -43,35 +43,81 @@ function decodeUplink(input) {
     } };
   }
 
-  // FPort 4 = ALERTA automatica por UMBRAL (threshold). 15 bytes.
+  // FPort 4 = ALERTA automatica por UMBRAL (threshold). 17 bytes desde v2.9.
+  //
+  // Hay DOS mascaras y no significan lo mismo:
+  //   triggered (byte 0)  = FLANCO: que cruzo el umbral en ese ciclo. No se
+  //                         re-arma hasta que el valor baja de umbral*0.9, asi
+  //                         que un valor alto desde hace rato NO aparece aqui.
+  //   above     (byte 16) = NIVEL: que estaba por encima del umbral en ese
+  //                         instante. Es el que hay que mirar para pintar
+  //                         estado; 'triggered' es para el evento.
+  //
+  // valid (byte 15) dice que sensor respalda cada valor. Un campo cuyo sensor
+  // tiene el bit a 0 vale 0 pero NO es una medida: es "sin dato" (se devuelve
+  // null). Los nodos <= v2.8 mandan 15 bytes y no traen estos dos bytes.
   if (input.fPort === 4) {
     if (b.length < 15) {
-      return { errors: ["alerta demasiado corta: " + b.length + " (esperado 15)"] };
+      return { errors: ["alerta demasiado corta: " + b.length + " (esperado 17)"] };
     }
     var m = b[0];
     var fire = (m & 0x80) !== 0;
-    return { data: {
+    var legacy = b.length < 17;             // nodo v2.8 o anterior
+
+    function bits(x) {
+      return {
+        temperature: (x & 0x01) !== 0,
+        co:          (x & 0x02) !== 0,
+        pm2_5:       (x & 0x04) !== 0,
+        pm10:        (x & 0x08) !== 0,
+        voc:         (x & 0x10) !== 0,
+        gas:         (x & 0x20) !== 0,
+        heat_rate:   (x & 0x40) !== 0,      // EN 54-5 rate-of-rise (subida rapida)
+        fire:        (x & 0x80) !== 0
+      };
+    }
+
+    // Sin byte de validez (nodo antiguo) no se puede afirmar nada: se asumen
+    // validos, que es como se venia interpretando hasta ahora.
+    var v     = legacy ? 0xFF : b[15];
+    var bmOk  = (v & 0x01) !== 0;
+    var coOk  = (v & 0x02) !== 0;
+    var senOk = (v & 0x08) !== 0;
+
+    var out = {
       alert: fire ? "FIRE" : "THRESHOLD",   // FUEGO confirmado (multicriterio) vs umbral simple
       fire_confirmed: fire,                 // EN 54-30/31: coincidencia de >=2 familias
-      triggered: {
-        temperature: (m & 0x01) !== 0,
-        co:          (m & 0x02) !== 0,
-        pm2_5:       (m & 0x04) !== 0,
-        pm10:        (m & 0x08) !== 0,
-        voc:         (m & 0x10) !== 0,
-        gas:         (m & 0x20) !== 0,
-        heat_rate:   (m & 0x40) !== 0,      // EN 54-5 rate-of-rise (subida rapida)
-        fire:        fire
-      },
+      triggered: bits(m),                   // FLANCO: que cruzo
       values: {
-        temperature_c:      s16(1) / 100,
-        co_ppm:             u16(3) / 10,
-        pm2p5_ugm3:         u16(5) / 10,
-        pm10_ugm3:          u16(7) / 10,
-        voc_index:          u16(9) / 10,
-        gas_resistance_ohm: u32(11)
-      }
-    }};
+        temperature_c:      bmOk  ? s16(1) / 100 : null,
+        co_ppm:             coOk  ? u16(3) / 10  : null,
+        pm2p5_ugm3:         senOk ? u16(5) / 10  : null,
+        pm10_ugm3:          senOk ? u16(7) / 10  : null,
+        voc_index:          senOk ? u16(9) / 10  : null,
+        gas_resistance_ohm: bmOk  ? u32(11)      : null
+      },
+      sensors_ok: { bm688: bmOk, ze15co: coOk, sen65: senOk },
+      legacy_payload: legacy
+    };
+
+    if (!legacy) {
+      out.above = bits(b[16]);              // NIVEL: que seguia por encima
+    }
+
+    // Un sensor caido no solo deja un hueco: apaga los umbrales que dependen
+    // de el. Sin BM688 no hay temperatura fija, ni rate-of-rise, ni familia
+    // CALOR para el criterio de FUEGO -> la deteccion de ese nodo queda
+    // reducida. Que se vea en el JSON y no haya que deducirlo.
+    var down = [];
+    if (!bmOk)  { down.push("bm688"); }
+    if (!coOk)  { down.push("ze15co"); }
+    if (!senOk) { down.push("sen65"); }
+    if (down.length > 0) {
+      out.warnings = ["sensor sin lectura valida: " + down.join(", ") +
+                      " (sus umbrales no estan vigilando)"];
+    }
+
+    return { data: out };
   }
 
   // FPort 5 = SALUD DEL NODO. El primer byte es el msg_type:

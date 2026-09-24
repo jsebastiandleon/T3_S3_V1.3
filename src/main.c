@@ -196,7 +196,7 @@ static void i2c1_scan(void)
  * correspondia a ningun valor jamas commiteado de LORA_SEND_PERIOD_S, y no
  * habia manera de confirmarlo desde el servidor. Regla: si cambias algo que
  * se flashea, SUBE FW_VERSION. */
-#define FW_VERSION    0x0208   /* v2.8 — aviso reencolado si falla el envio */
+#define FW_VERSION    0x0209   /* v2.9 — FPort 4 con validez y nivel de umbral */
 
 /* =======================================================================
  *  CALIBRACION — OFFSET DE TEMPERATURA   <-- MIDE Y AJUSTA AQUI
@@ -784,17 +784,44 @@ int main(void)
     } __packed payload;
 
     /*
-     * Payload de ALERTA por umbral (FPORT_ALERT, 15 bytes, little-endian).
-     * Autodescriptivo: mascara de que umbrales estan superados + los valores
-     * instantaneos relevantes en el momento de la alerta.
+     * Payload de ALERTA por umbral (FPORT_ALERT, 17 bytes, little-endian).
+     * Autodescriptivo: que cruzo, que sigue alto, que sensores son de fiar y
+     * los valores del instante del disparo.
      *   [0]     uint8  alert_mask: bit0 temp, bit1 CO, bit2 PM2.5, bit3 PM10,
-     *                              bit4 VOC, bit5 gas
+     *                              bit4 VOC, bit5 gas, bit6 rate-of-rise,
+     *                              bit7 FUEGO confirmado
      *   [1-2]   int16  temperatura × 100 (°C)
      *   [3-4]   uint16 CO          × 10  (ppm)
      *   [5-6]   uint16 PM2.5       × 10  (µg/m³)
      *   [7-8]   uint16 PM10        × 10  (µg/m³)
      *   [9-10]  uint16 VOC index   × 10
      *   [11-14] uint32 gas resistance    (Ohm)
+     *   [15]    uint8  valid_mask  — QUE SENSOR RESPALDA CADA VALOR. Mismos bits
+     *                              que el byte 0 del FPort 2: bit0 BM688,
+     *                              bit1 ZE15-CO, bit3 SEN65. El campo de un
+     *                              sensor con el bit a 0 va a 0 y NO es una
+     *                              medida: es "sin dato".
+     *   [16]    uint8  active_mask — QUE UMBRALES ESTABAN POR ENCIMA en ese
+     *                              instante (NIVEL), frente a alert_mask, que
+     *                              es el FLANCO (lo que cruzo justo entonces).
+     *                              Mismos bits que alert_mask.
+     *
+     * Los bytes [15] y [16] se AÑADEN al final: los offsets [0]-[14] no se
+     * mueven, asi que un decoder de la v2.8 sigue leyendo esta trama.
+     *
+     * POR QUE EXISTE valid_mask: hasta la v2.8 este payload copiaba ps.* sin
+     * mirar si la lectura era valida. Un nodo cuyo sensor nunca habia leido
+     * bien desde el arranque emitia el contenido sin inicializar de esa
+     * estructura -> en campo se vio un CO de 6553.5 ppm (0xFFFF), imposible:
+     * el driver enmascara el byte alto con 0x1F, o sea 819.1 ppm como mucho,
+     * y el ZE15-CO solo llega a 500. Tambien salian temperatura 0 y gas 0 en
+     * nodos con el BM688 caido, sin forma de distinguirlos de un 0 real.
+     *
+     * POR QUE EXISTE active_mask: alert_mask es un FLANCO y no se re-arma
+     * hasta que el valor baja de umbral*(1-histeresis). Con PM2.5 alto desde
+     * hacia rato y PM10 cruzando por primera vez, la trama marcaba SOLO PM10
+     * aunque el PM2.5 fuese de 433 µg/m³ -> el servidor no podia saber el
+     * nivel sin reimplementar la histeresis. Ahora lo lleva escrito.
      */
     struct {
         uint8_t  alert_mask;
@@ -804,7 +831,9 @@ int main(void)
         uint16_t pm10_0_x10;
         uint16_t voc_x10;
         uint32_t gas_ohm;
-    } __packed alert;
+        uint8_t  valid_mask;
+        uint8_t  active_mask;
+    } __packed alert = {0};
 
     /*
      * Payload de DIAGNOSTICO de arranque (FPORT_DIAG, 13 bytes, little-endian).
@@ -869,6 +898,7 @@ int main(void)
        nada fallase visiblemente. Que rompa la compilacion, no el diagnostico. */
     BUILD_ASSERT(sizeof(diag)  == 13, "FPORT_DIAG BOOT debe ocupar 13 bytes");
     BUILD_ASSERT(sizeof(fault) == 14, "FPORT_DIAG FAULT debe ocupar 14 bytes");
+    BUILD_ASSERT(sizeof(alert) == 17, "FPORT_ALERT debe ocupar 17 bytes");
 
     /* El DIAG de arranque es de MINIMA prioridad: nunca debe robarle airtime
        al FPort 2, a una alerta ni a una señal de averia. Va CONFIRMED porque
@@ -879,8 +909,13 @@ int main(void)
     int64_t last_diag_ms  = 0;
     int     diag_attempts = 0;
 
-    /* Snapshot que se publica al portal en cada ciclo (lectura instantanea). */
-    struct portal_sensors ps;
+    /* Snapshot que se publica al portal en cada ciclo (lectura instantanea).
+       Inicializado a cero: los campos de un sensor solo se escriben cuando su
+       lectura sale bien, asi que sin esto un sensor que NUNCA ha leido bien
+       deja su campo con el contenido indeterminado de la pila. El portal se
+       protege con los flags *_valid, pero el payload de alerta lo leia a
+       ciegas y llego a emitirlo por radio. Ver FPORT_ALERT / valid_mask. */
+    struct portal_sensors ps = {0};
 
     /*
      * Acumuladores para el PROMEDIO del uplink. Cada lectura valida suma aqui;
@@ -1273,12 +1308,25 @@ int main(void)
            medida ya haya bajado (evita mandar una alerta con valores ya
            recuperados). */
         if (alert_fired != 0) {
-            alert.temp_cdeg  = (int16_t)(ps.temperature * 100.0);
-            alert.co_ppm_x10 = (uint16_t)(ps.co_ppm * 10.0);
-            alert.pm2_5_x10  = (uint16_t)(ps.pm2_5 * 10.0);
-            alert.pm10_0_x10 = (uint16_t)(ps.pm10_0 * 10.0);
-            alert.voc_x10    = (uint16_t)(ps.voc_index * 10.0);
-            alert.gas_ohm    = (uint32_t)ps.gas_resistance;
+            /* Un sensor en fallo NO tiene valor que contar: su campo va a 0 y
+               su bit se cae de valid_mask, igual que hace el FPort 2. Copiarlo
+               a ciegas es lo que emitia lecturas fantasma (CO=6553.5 ppm). */
+            alert.temp_cdeg  = ps.bm688_valid ? (int16_t)(ps.temperature * 100.0) : 0;
+            alert.gas_ohm    = ps.bm688_valid ? (uint32_t)ps.gas_resistance       : 0;
+            alert.co_ppm_x10 = ps.co_valid    ? (uint16_t)(ps.co_ppm * 10.0)      : 0;
+            alert.pm2_5_x10  = ps.sen65_valid ? (uint16_t)(ps.pm2_5 * 10.0)       : 0;
+            alert.pm10_0_x10 = ps.sen65_valid ? (uint16_t)(ps.pm10_0 * 10.0)      : 0;
+            alert.voc_x10    = ps.sen65_valid ? (uint16_t)(ps.voc_index * 10.0)   : 0;
+
+            alert.valid_mask = (ps.bm688_valid ? FLAG_BM688_OK : 0) |
+                               (ps.co_valid    ? FLAG_CO_OK    : 0) |
+                               (ps.sen65_valid ? FLAG_SEN65_OK : 0);
+
+            /* NIVEL del mismo instante que los valores: se captura aqui, no al
+               enviar, para que toda la trama describa UN solo momento (el
+               envio puede retrasarse por cooldown o por prioridad del FPort 2
+               y para entonces el nivel ya seria otro). */
+            alert.active_mask = alert_active;
         }
 
         /* Un FUEGO recien confirmado (EN 54-30/31) es critico -> se envia YA,
@@ -1429,7 +1477,9 @@ int main(void)
 
         if (joined && alert_pending != 0 && alert_slot_ok && cooldown_ok) {
             /* El mask reporta que umbrales CRUZARON en la ventana (pending),
-               nunca 0; alert_active es solo informativo (que sigue alto ahora). */
+               nunca 0. El NIVEL viaja aparte en alert.active_mask, capturado
+               en el flanco junto a los valores; el alert_active de este ciclo
+               es el de AHORA y solo se traza en el log. */
             alert.alert_mask = alert_pending;
 
             int aret = lorawan_send(FPORT_ALERT, (uint8_t *)&alert,

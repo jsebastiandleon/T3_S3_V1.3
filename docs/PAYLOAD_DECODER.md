@@ -15,7 +15,7 @@ FPort para poder enrutarlo/actuar por separado en ChirpStack:
 |---|---|---|
 | **2** | uplink | **Datos** periódicos (promedio de la ventana), 29 B. Este doc §2. |
 | **3** | uplink | **Aviso de incidencia** del portal (4 B): `msg_type`=1, `source` (1=962878800, 2=092), `count` u16 LE → `{"alert":"INCIDENCIA","source":"portal_call","llamada":"962878800","avisos":N}`. Los nodos con firmware antiguo mandan aquí el ASCII `"SOS"` (3 B) del botón retirado; el decoder lo sigue reconociendo con `legacy:true`. |
-| **4** | uplink | **Alerta por umbral** (threshold), 15 B. Ver §2.1. |
+| **4** | uplink | **Alerta por umbral** (threshold), 17 B desde v2.9 (15 B hasta v2.8). Ver §2.1. |
 | **10** | downlink | Actualización OTA del HTML del portal (BEGIN/DATA/COMMIT). |
 
 Los FPorts de envío se definen en el bloque *CANALES (FPorts)* al principio de
@@ -86,7 +86,7 @@ Los FPorts de envío se definen en el bloque *CANALES (FPorts)* al principio de
 Los campos de un sensor ausente van a **0**; usar **flags** (byte 0) para saber
 qué es válido. No hay CRC de aplicación: LoRaWAN ya protege la trama (MIC).
 
-### 2.1 Payload de ALERTA por umbral (FPort 4, 15 bytes, little-endian)
+### 2.1 Payload de ALERTA por umbral (FPort 4, 17 bytes, little-endian)
 
 Se envía **automáticamente** cuando una lectura instantánea **cruza** un umbral
 configurado (flanco de subida). No se reenvía hasta que el valor baje del umbral
@@ -101,19 +101,65 @@ configurado (flanco de subida). No se reenvía hasta que el valor baje del umbra
 | 7–8 | uint16 | PM10 | ÷10 → µg/m³ |
 | 9–10 | uint16 | VOC index | ÷10 |
 | 11–14 | uint32 | gas resistance | → Ω |
+| 15 | uint8 | **valid_mask** | qué sensor respalda cada valor: bit0 BM688 · bit1 ZE15-CO · bit3 SEN65 (mismos bits que el byte 0 del FPort 2) |
+| 16 | uint8 | **active_mask** | qué umbrales estaban **por encima** en ese instante (mismos bits que `alert_mask`) |
 
-El mask reporta lo que **cruzó** durante la ventana (nunca 0), y los valores son
-los del **instante del disparo**. **bit7 = FUEGO** se activa por coincidencia
-multicriterio (ver abajo) y ese uplink se envía **de inmediato** (salta el
-cooldown). El decoder pone `alert:"FIRE"` y `fire_confirmed:true` cuando bit7=1.
+Los bytes **15 y 16 se añaden al final** en la v2.9: los offsets 0–14 no se
+mueven, así que un decoder antiguo sigue leyendo la trama y uno nuevo acepta
+las tramas de 15 B de los nodos aún sin actualizar (`legacy_payload: true`).
+
+**`alert_mask` es FLANCO, `active_mask` es NIVEL.** Es la distinción que más
+confusión ha causado, así que conviene tenerla clara:
+
+- `alert_mask` = qué **cruzó** el umbral en ese ciclo. Un bit que ya disparó
+  **no vuelve a aparecer** hasta que el valor baje de `umbral × 0.9` y lo cruce
+  otra vez. Nunca es 0.
+- `active_mask` = qué **estaba por encima** del umbral en ese mismo instante.
+
+Caso real: PM2.5 = 433 µg/m³ llevaba rato alto (ya había disparado) y el PM10
+cruzó los 150 por primera vez. `alert_mask` marcaba **solo PM10**, que es
+correcto pero parecía un fallo. Con `active_mask` se ve que **ambos** estaban
+altos. Para pintar estado usar `active_mask`; para el evento, `alert_mask`.
+
+**`valid_mask` distingue "0" de "sin dato".** El campo de un sensor cuyo bit
+está a 0 vale 0 pero **no es una medida**; el decoder lo devuelve como `null`.
+Hasta la v2.8 este payload copiaba el último valor sin comprobar validez, y un
+nodo cuyo sensor nunca había leído bien desde el arranque emitía memoria sin
+inicializar — de ahí los **CO = 6553.5 ppm** (0xFFFF, imposible: el driver
+enmascara con `0x1F`, tope 819.1 ppm) y las **temperaturas/gas a 0** vistos en
+campo. Un sensor caído además **apaga sus umbrales**: sin BM688 no hay
+temperatura fija, ni rate-of-rise, ni familia *calor* para el criterio de
+FUEGO, así que el decoder lo avisa en `warnings`.
+
+Los valores son los del **instante del disparo** (incluido `active_mask`, para
+que toda la trama describa un solo momento: el envío puede retrasarse por el
+cooldown o por la prioridad del FPort 2). **bit7 = FUEGO** se activa por
+coincidencia multicriterio (ver abajo) y ese uplink se envía **de inmediato**
+(salta el cooldown). El decoder pone `alert:"FIRE"` y `fire_confirmed:true`.
 
 Salida del decoder (FPort 4) — ejemplo de FUEGO confirmado (humo + CO):
 ```json
 { "alert": "FIRE", "fire_confirmed": true,
   "triggered": { "temperature": false, "co": true, "pm2_5": true, "pm10": true,
                  "voc": false, "gas": false, "heat_rate": false, "fire": true },
+  "above":     { "temperature": false, "co": true, "pm2_5": true, "pm10": true,
+                 "voc": false, "gas": false, "heat_rate": false, "fire": true },
   "values": { "temperature_c": 33.0, "co_ppm": 50.0, "pm2p5_ugm3": 2918.0,
-              "pm10_ugm3": 873.5, "voc_index": 9.0, "gas_resistance_ohm": 20700 } }
+              "pm10_ugm3": 873.5, "voc_index": 9.0, "gas_resistance_ohm": 20700 },
+  "sensors_ok": { "bm688": true, "ze15co": true, "sen65": true },
+  "legacy_payload": false }
+```
+
+Ejemplo con el BM688 caído — el `null` y el aviso son la diferencia frente a
+leer un 0 como si fuese una temperatura:
+```json
+{ "alert": "THRESHOLD", "fire_confirmed": false,
+  "triggered": { "pm10": true, "...": false },
+  "above":     { "pm2_5": true, "pm10": true, "...": false },
+  "values": { "temperature_c": null, "pm2p5_ugm3": 433.0, "pm10_ugm3": 160.0,
+              "gas_resistance_ohm": null },
+  "sensors_ok": { "bm688": false, "ze15co": true, "sen65": true },
+  "warnings": ["sensor sin lectura valida: bm688 (sus umbrales no estan vigilando)"] }
 ```
 
 **Dónde se definen los umbrales:** bloque *UMBRALES DE ALERTA* al principio de

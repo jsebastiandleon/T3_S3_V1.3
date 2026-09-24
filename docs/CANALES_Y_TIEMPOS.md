@@ -13,7 +13,7 @@ tipo, para que en ChirpStack puedas **enrutar/actuar cada uno por separado**
 |---|---|---|---|
 | **2** `FPORT_DATA` | uplink | Datos de sensores (promedio), 29 B | cada `LORA_SEND_PERIOD_S` |
 | **3** `FPORT_INCID` | uplink | Aviso de incidencia (4 B) del portal | al tocar un teléfono en el portal (≤1 ciclo) |
-| **4** `FPORT_ALERT` | uplink | Alerta por umbral (15 B) | al cruzar un umbral (flanco) |
+| **4** `FPORT_ALERT` | uplink | Alerta por umbral (17 B) | al cruzar un umbral (flanco) |
 | **5** `FPORT_DIAG` | uplink | Salud del nodo (13/14 B) | al arrancar y al caer/recuperarse un sensor |
 | **10** `PORTAL_HTML_OTA_FPORT` | downlink | Actualización OTA del HTML | cuando mandas el downlink |
 
@@ -261,7 +261,12 @@ Reglas anti-spam:
   para respetar el duty-cycle. Si un envío falla por `-111`, la alerta queda
   pendiente y se reintenta (no se pierde).
 
-Payload de 15 B autodescriptivo (máscara de qué cruzó + valores). Formato y
+Payload de 17 B autodescriptivo. Lleva **dos** máscaras, que no son lo mismo:
+`alert_mask` (byte 0) es el **flanco** — qué cruzó en ese ciclo — y `active_mask`
+(byte 16) es el **nivel** — qué seguía por encima. Un valor alto desde hace rato
+aparece en la segunda y no en la primera, que es lo que hay que mirar para
+pintar estado. El byte 15 (`valid_mask`) dice qué sensor respalda cada valor:
+un campo sin su bit vale 0 pero significa **sin dato**, no cero. Formato y
 salida del decoder en [`docs/PAYLOAD_DECODER.md`](PAYLOAD_DECODER.md) §2.1.
 
 ---
